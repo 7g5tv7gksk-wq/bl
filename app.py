@@ -583,10 +583,13 @@ def get_price(mint):
 # =====================================================================
 def run_monitor():
     logging.info("⚡ [MONITOR] Position monitor started (1s loop)")
+    heartbeat = 0
     while True:
+        heartbeat += 1
         try:
             if active_positions:
-                to_close = []
+                to_close   = []
+                pnl_lines  = []
                 for mint, info in list(active_positions.items()):
                     price = get_price(mint)
                     if not price or info["entry_price"] == 0:
@@ -594,6 +597,10 @@ def run_monitor():
 
                     pnl    = (price - info["entry_price"]) / info["entry_price"]
                     symbol = info["symbol"]
+                    pnl_lines.append(
+                        f"${symbol} {pnl*100:+.1f}% "
+                        f"(entry ${info['entry_price']:.8f} → ${price:.8f})"
+                    )
 
                     if pnl >= TAKE_PROFIT_PCT:
                         sol_gain = SOL_TRADE_SIZE * pnl
@@ -637,6 +644,10 @@ def run_monitor():
                 for mint in to_close:
                     active_positions.pop(mint, None)
                     coin_trackers.pop(mint, None)    # Clear stale tracker on exit
+
+                # Unrealized PnL heartbeat — every 10s, not every 1s (avoid log spam)
+                if pnl_lines and heartbeat % 10 == 0:
+                    logging.info("📟 [PNL] " + " | ".join(pnl_lines))
 
         except Exception as e:
             logging.error(f"❌ [MONITOR] {e}")
@@ -697,9 +708,13 @@ def run_bot():
             mints    = fetch_organic_candidates()
             pair_map = fetch_dex_batch(mints) if mints else {}
 
+            # Pass 1 — evaluate every candidate in the batch and collect the
+            # ones that clear their threshold. We don't enter yet: we want to
+            # rank the whole cycle first and take the strongest signal(s),
+            # not just whichever mint happened to come first in the list.
+            candidates = []
+
             for mint in mints:
-                if len(active_positions) >= MAX_POSITIONS:
-                    break
                 if mint in active_positions:
                     continue
 
@@ -755,6 +770,33 @@ def run_bot():
                 if signal < threshold:
                     continue
 
+                candidates.append({
+                    "mint": mint, "symbol": symbol, "price": price, "mc": mc,
+                    "signal": signal, "signal_src": signal_src,
+                    "ready": tracker.ready,
+                    "state": tracker.current_state if tracker.ready else None,
+                    "stickiness": tracker.stickiness if tracker.ready else None,
+                })
+
+            # Pass 2 — rank qualifying candidates best-signal-first
+            if candidates:
+                candidates.sort(key=lambda c: c["signal"], reverse=True)
+                top = " | ".join(
+                    f"${c['symbol']} {c['signal']:+.3f}" for c in candidates[:5]
+                )
+                logging.info(
+                    f"🏆 [RANKING] {len(candidates)} qualified this cycle | Top: {top}"
+                )
+
+            slots_open = MAX_POSITIONS - len(active_positions)
+
+            for cand in candidates:
+                if slots_open <= 0:
+                    break
+                mint = cand["mint"]
+                if mint in active_positions:      # could've filled since ranking
+                    continue
+
                 # ── Familiars owner limit check ──────────────────────
                 limits      = familiars_limits()
                 max_pos_usd = limits.get("maxPositionUsd")
@@ -770,13 +812,13 @@ def run_bot():
 
                 # ── Entry ────────────────────────────────────────────
                 reason_parts = [
-                    f"${symbol}", f"MC=${mc:,.0f}",
-                    f"SOL={sol_regime}", f"Signal={signal:+.3f} [{signal_src}]"
+                    f"${cand['symbol']}", f"MC=${cand['mc']:,.0f}",
+                    f"SOL={sol_regime}", f"Signal={cand['signal']:+.3f} [{cand['signal_src']}]"
                 ]
-                if tracker.ready:
+                if cand["ready"]:
                     reason_parts += [
-                        f"State={STATE_NAME[tracker.current_state]}",
-                        f"Stickiness={tracker.stickiness}",
+                        f"State={STATE_NAME[cand['state']]}",
+                        f"Stickiness={cand['stickiness']}",
                     ]
                 reason = " | ".join(reason_parts)
 
@@ -784,14 +826,18 @@ def run_bot():
                 familiars_post("callout", f"Entering {reason}", mint=mint)
 
                 if PAPER_TRADING:
-                    active_positions[mint] = {"symbol": symbol, "entry_price": price}
+                    active_positions[mint] = {
+                        "symbol": cand["symbol"], "entry_price": cand["price"]
+                    }
                     logging.info(
                         f"💰 [PAPER] BUY {SOL_TRADE_SIZE} SOL → "
-                        f"${symbol} @ ${price:.8f}"
+                        f"${cand['symbol']} @ ${cand['price']:.8f}"
                     )
                 # ── Live execution stub ──────────────────────────────
                 # When ready: set PAPER_TRADING = False and add Jupiter swap here
                 # jupiter_swap(mint, SOL_TRADE_SIZE, slippage_bps=100)
+
+                slots_open -= 1
 
         except Exception as e:
             logging.error(f"❌ [LOOP] {e}")
