@@ -391,6 +391,7 @@ class CoinMarkovTracker:
 def fetch_organic_candidates():
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     mints = []
+    source_report = []   # per-source diagnostic: (label, count_added, note)
 
     # Source A: DexScreener trending SOL search
     try:
@@ -399,13 +400,17 @@ def fetch_organic_candidates():
             headers=headers, timeout=5
         )
         if r.status_code == 200:
+            before = len(mints)
             for p in r.json().get("pairs", [])[:20]:
                 if p.get("chainId") == "solana":
                     addr = p.get("baseToken", {}).get("address")
                     if addr and addr not in mints:
                         mints.append(addr)
+            source_report.append(("DexA", len(mints) - before, "ok"))
+        else:
+            source_report.append(("DexA", 0, f"HTTP {r.status_code}"))
     except Exception as e:
-        logging.warning(f"⚠️ [SCRAPER] DexScreener: {e}")
+        source_report.append(("DexA", 0, f"exc: {e}"))
 
     # Source B: Jupiter recent mints V2
     try:
@@ -414,14 +419,18 @@ def fetch_organic_candidates():
             headers=headers, timeout=5
         )
         if r.status_code == 200:
+            before = len(mints)
             data  = r.json()
             items = data if isinstance(data, list) else data.get("tokens", [])
             for item in items[:20]:
                 addr = item.get("address") or item.get("mint")
                 if addr and addr not in mints:
                     mints.append(addr)
+            source_report.append(("Jupiter", len(mints) - before, "ok"))
+        else:
+            source_report.append(("Jupiter", 0, f"HTTP {r.status_code}"))
     except Exception as e:
-        logging.warning(f"⚠️ [SCRAPER] Jupiter: {e}")
+        source_report.append(("Jupiter", 0, f"exc: {e}"))
 
     # Source C: DexScreener token profiles (fallback if A+B thin)
     if len(mints) < 10:
@@ -431,15 +440,25 @@ def fetch_organic_candidates():
                 headers=headers, timeout=5
             )
             if r.status_code == 200:
+                before = len(mints)
                 for item in r.json()[:20]:
                     if item.get("chainId") == "solana":
                         addr = item.get("tokenAddress")
                         if addr and addr not in mints:
                             mints.append(addr)
+                source_report.append(("DexC", len(mints) - before, "ok"))
+            else:
+                source_report.append(("DexC", 0, f"HTTP {r.status_code}"))
         except Exception as e:
-            logging.warning(f"⚠️ [SCRAPER] DexScreener profiles: {e}")
+            source_report.append(("DexC", 0, f"exc: {e}"))
+    else:
+        source_report.append(("DexC", 0, "skipped (A+B sufficient)"))
 
-    logging.info(f"📡 [SCRAPER] {len(mints[:30])} candidate mints")
+    # One-line breakdown of what each source actually contributed this cycle —
+    # makes it possible to see WHICH source is going quiet, and why (rate
+    # limited vs empty response vs skipped), instead of just a final count.
+    breakdown = " | ".join(f"{label}:{count}({note})" for label, count, note in source_report)
+    logging.info(f"📡 [SCRAPER] {len(mints[:30])} candidate mints | {breakdown}")
     return mints[:30]
 
 
