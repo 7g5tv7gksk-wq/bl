@@ -822,8 +822,22 @@ def run_flask():
 
 # =====================================================================
 # ENTRY POINT
+#
+# IMPORTANT: gunicorn imports this module and never executes the
+# `if __name__ == "__main__":` block below — it just grabs the `app`
+# object. So the background threads are started unconditionally here,
+# at import time, so they run under gunicorn too.
+#
+# Render sets WEB_CONCURRENCY=1 automatically (confirmed in your deploy
+# logs). Keep it at 1 worker — with more than one, gunicorn would spawn
+# multiple copies of this module, meaning multiple scanner loops and
+# multiple monitor threads all trading independently against the same
+# limits.
 # =====================================================================
+threading.Thread(target=run_monitor, daemon=True).start()
+threading.Thread(target=run_bot,     daemon=True).start()
+
 if __name__ == "__main__":
-    threading.Thread(target=run_flask,  daemon=True).start()
-    threading.Thread(target=run_monitor, daemon=True).start()
-    run_bot()
+    # Only reached with `python app.py` directly (local testing).
+    # In production, gunicorn serves `app` itself — no need for run_flask().
+    run_flask()
