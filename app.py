@@ -510,6 +510,7 @@ def fetch_dex_batch(mints):
     if not mints:
         return {}
     if not dex_available():
+        logging.info("⏸️ [DEX BATCH] Skipped — DexScreener backoff active, no pair data this cycle")
         return {}   # respect the shared backoff — don't hammer while cooling down
     url = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(mints[:30])}"
     try:
@@ -526,7 +527,7 @@ def fetch_dex_batch(mints):
             # sleep here freezes the whole shared bot loop. Just mark the
             # shared backoff and return — no sleep.
             dex_mark_limited()
-            logging.warning("⚠️ [DEX BATCH] 429 → backoff set")
+            logging.warning("⚠️ [DEX BATCH] 429 → backoff set, no pair data this cycle")
     except Exception as e:
         logging.error(f"❌ [DEX BATCH] {e}")
     return {}
@@ -798,18 +799,33 @@ def run_bot():
             # not just whichever mint happened to come first in the list.
             candidates = []
 
+            # Tally WHY candidates drop out each cycle — without this, "no
+            # entries" and "no pair data at all" look identical in the logs.
+            tally = {
+                "total": len(mints), "in_position_or_blacklist": 0,
+                "no_pair_data": 0, "failed_pair_filters": 0,
+                "security_rejected": 0, "no_signal": 0,
+                "below_threshold": 0, "qualified": 0,
+            }
+
             for mint in mints:
                 if mint in active_positions:
+                    tally["in_position_or_blacklist"] += 1
                     continue
 
                 # Blacklist check
                 if mint in stopped_out_tokens:
                     if time.time() - stopped_out_tokens[mint] < BLACKLIST_COOLDOWN:
+                        tally["in_position_or_blacklist"] += 1
                         continue
                     del stopped_out_tokens[mint]
 
                 pair = pair_map.get(mint)
-                if not pair or not validate_pair(pair):
+                if not pair:
+                    tally["no_pair_data"] += 1
+                    continue
+                if not validate_pair(pair):
+                    tally["failed_pair_filters"] += 1
                     continue
 
                 symbol       = pair.get("baseToken", {}).get("symbol", "?")
@@ -820,9 +836,11 @@ def run_bot():
                 # Security screen
                 if not check_rugcheck(mint):
                     logging.info(f"🛡️ [REJECTED] ${symbol} — RugCheck fail")
+                    tally["security_rejected"] += 1
                     continue
                 if not check_gmgn(mint):
                     logging.info(f"🛡️ [REJECTED] ${symbol} — GMGN fail")
+                    tally["security_rejected"] += 1
                     continue
 
                 # ── Layers 2 / 3: signal selection ──────────────────
@@ -844,6 +862,7 @@ def run_bot():
                     threshold  = MOMENTUM_THRESHOLD
 
                 if signal is None:
+                    tally["no_signal"] += 1
                     continue
 
                 logging.info(
@@ -852,8 +871,10 @@ def run_bot():
                 )
 
                 if signal < threshold:
+                    tally["below_threshold"] += 1
                     continue
 
+                tally["qualified"] += 1
                 candidates.append({
                     "mint": mint, "symbol": symbol, "price": price, "mc": mc,
                     "signal": signal, "signal_src": signal_src,
@@ -861,6 +882,21 @@ def run_bot():
                     "state": tracker.current_state if tracker.ready else None,
                     "stickiness": tracker.stickiness if tracker.ready else None,
                 })
+
+            # Always log the funnel — this is what tells us WHY a cycle
+            # produced no entries: no candidates, no market data (backoff),
+            # strict filters, security rejections, or just no signal yet.
+            if mints:
+                logging.info(
+                    f"🔍 [FUNNEL] {tally['total']} candidates → "
+                    f"skip={tally['in_position_or_blacklist']} | "
+                    f"no_pair_data={tally['no_pair_data']} | "
+                    f"failed_filters={tally['failed_pair_filters']} | "
+                    f"security_rejected={tally['security_rejected']} | "
+                    f"no_signal={tally['no_signal']} | "
+                    f"below_threshold={tally['below_threshold']} | "
+                    f"qualified={tally['qualified']}"
+                )
 
             # Pass 2 — rank qualifying candidates.
             # IMPORTANT: Markov signal is bounded to [-1, +1] by construction
