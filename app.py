@@ -57,6 +57,21 @@ coin_trackers     = {}    # mint → CoinMarkovTracker
 trade_stats = {"total_closed": 0, "wins": 0, "losses": 0, "net_sol_pnl": 0.0}
 _sol_cache = {"state": "SIDEWAYS", "last_check": 0}
 
+# DexScreener is a shared public API and Render's egress IPs get rate-limited
+# under real load (confirmed in production logs — 429s on both DexScreener
+# endpoints, back to back, cycle after cycle). ALL DexScreener call sites
+# (candidate scraper, batch pair fetch, price fallback) share this single
+# backoff so one 429 anywhere stops hammering the domain everywhere, instead
+# of each call site tripping and retrying independently.
+_dex_backoff = {"until": 0}
+DEX_BACKOFF_SECONDS = 30
+
+def dex_available():
+    return time.time() >= _dex_backoff["until"]
+
+def dex_mark_limited():
+    _dex_backoff["until"] = time.time() + DEX_BACKOFF_SECONDS
+
 # Markov state constants
 BULL, SIDEWAYS, BEAR = 0, 1, 2
 STATE_NAME = {BULL: "BULL", SIDEWAYS: "SIDEWAYS", BEAR: "BEAR"}
@@ -394,25 +409,34 @@ def fetch_organic_candidates():
     source_report = []   # per-source diagnostic: (label, count_added, note)
 
     # Source A: DexScreener trending SOL search
-    try:
-        r = requests.get(
-            "https://api.dexscreener.com/latest/dex/search?q=sol",
-            headers=headers, timeout=5
-        )
-        if r.status_code == 200:
-            before = len(mints)
-            for p in r.json().get("pairs", [])[:20]:
-                if p.get("chainId") == "solana":
-                    addr = p.get("baseToken", {}).get("address")
-                    if addr and addr not in mints:
-                        mints.append(addr)
-            source_report.append(("DexA", len(mints) - before, "ok"))
-        else:
-            source_report.append(("DexA", 0, f"HTTP {r.status_code}"))
-    except Exception as e:
-        source_report.append(("DexA", 0, f"exc: {e}"))
+    if dex_available():
+        try:
+            r = requests.get(
+                "https://api.dexscreener.com/latest/dex/search?q=sol",
+                headers=headers, timeout=5
+            )
+            if r.status_code == 200:
+                before = len(mints)
+                for p in r.json().get("pairs", [])[:20]:
+                    if p.get("chainId") == "solana":
+                        addr = p.get("baseToken", {}).get("address")
+                        if addr and addr not in mints:
+                            mints.append(addr)
+                source_report.append(("DexA", len(mints) - before, "ok"))
+            elif r.status_code == 429:
+                dex_mark_limited()
+                source_report.append(("DexA", 0, "HTTP 429→backoff"))
+            else:
+                source_report.append(("DexA", 0, f"HTTP {r.status_code}"))
+        except Exception as e:
+            source_report.append(("DexA", 0, f"exc: {e}"))
+    else:
+        source_report.append(("DexA", 0, "skipped(backoff)"))
 
     # Source B: Jupiter recent mints V2
+    # NOTE: current Jupiter Token API v2 endpoints wrap results as
+    # {"data": [...]}, not a bare list or {"tokens": [...]} — that mismatch
+    # was silently returning 0 items every cycle despite HTTP 200.
     try:
         r = requests.get(
             "https://api.jup.ag/tokens/v2/recent",
@@ -420,13 +444,24 @@ def fetch_organic_candidates():
         )
         if r.status_code == 200:
             before = len(mints)
-            data  = r.json()
-            items = data if isinstance(data, list) else data.get("tokens", [])
+            data = r.json()
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = data.get("data") or data.get("tokens") or []
+            else:
+                items = []
             for item in items[:20]:
-                addr = item.get("address") or item.get("mint")
+                addr = item.get("address") or item.get("mint") or item.get("id")
                 if addr and addr not in mints:
                     mints.append(addr)
-            source_report.append(("Jupiter", len(mints) - before, "ok"))
+            added = len(mints) - before
+            if added:
+                note = "ok"
+            else:
+                shape = list(data.keys()) if isinstance(data, dict) else "list"
+                note = f"0 items, keys={shape}"
+            source_report.append(("Jupiter", added, note))
         else:
             source_report.append(("Jupiter", 0, f"HTTP {r.status_code}"))
     except Exception as e:
@@ -434,25 +469,31 @@ def fetch_organic_candidates():
 
     # Source C: DexScreener token profiles (fallback if A+B thin)
     if len(mints) < 10:
-        try:
-            r = requests.get(
-                "https://api.dexscreener.com/token-profiles/latest/v1",
-                headers=headers, timeout=5
-            )
-            if r.status_code == 200:
-                before = len(mints)
-                for item in r.json()[:20]:
-                    if item.get("chainId") == "solana":
-                        addr = item.get("tokenAddress")
-                        if addr and addr not in mints:
-                            mints.append(addr)
-                source_report.append(("DexC", len(mints) - before, "ok"))
-            else:
-                source_report.append(("DexC", 0, f"HTTP {r.status_code}"))
-        except Exception as e:
-            source_report.append(("DexC", 0, f"exc: {e}"))
+        if dex_available():
+            try:
+                r = requests.get(
+                    "https://api.dexscreener.com/token-profiles/latest/v1",
+                    headers=headers, timeout=5
+                )
+                if r.status_code == 200:
+                    before = len(mints)
+                    for item in r.json()[:20]:
+                        if item.get("chainId") == "solana":
+                            addr = item.get("tokenAddress")
+                            if addr and addr not in mints:
+                                mints.append(addr)
+                    source_report.append(("DexC", len(mints) - before, "ok"))
+                elif r.status_code == 429:
+                    dex_mark_limited()
+                    source_report.append(("DexC", 0, "HTTP 429→backoff"))
+                else:
+                    source_report.append(("DexC", 0, f"HTTP {r.status_code}"))
+            except Exception as e:
+                source_report.append(("DexC", 0, f"exc: {e}"))
+        else:
+            source_report.append(("DexC", 0, "skipped(backoff)"))
     else:
-        source_report.append(("DexC", 0, "skipped (A+B sufficient)"))
+        source_report.append(("DexC", 0, "skipped(A+B sufficient)"))
 
     # One-line breakdown of what each source actually contributed this cycle —
     # makes it possible to see WHICH source is going quiet, and why (rate
@@ -468,6 +509,8 @@ def fetch_organic_candidates():
 def fetch_dex_batch(mints):
     if not mints:
         return {}
+    if not dex_available():
+        return {}   # respect the shared backoff — don't hammer while cooling down
     url = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(mints[:30])}"
     try:
         r = requests.get(url, timeout=8)
@@ -479,8 +522,11 @@ def fetch_dex_batch(mints):
                     pair_map[addr] = p
             return pair_map
         if r.status_code == 429:
-            logging.warning("⚠️ [DEX BATCH] 429 — backing off 15s")
-            time.sleep(15)
+            # Same class of bug as the earlier GeckoTerminal fix: a blocking
+            # sleep here freezes the whole shared bot loop. Just mark the
+            # shared backoff and return — no sleep.
+            dex_mark_limited()
+            logging.warning("⚠️ [DEX BATCH] 429 → backoff set")
     except Exception as e:
         logging.error(f"❌ [DEX BATCH] {e}")
     return {}
@@ -599,17 +645,20 @@ def get_price(mint):
                 return float(p)
     except Exception:
         pass
-    try:
-        r = requests.get(
-            f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-            timeout=3
-        )
-        if r.status_code == 200:
-            pairs = r.json().get("pairs", [])
-            if pairs:
-                return float(pairs[0].get("priceUsd", 0) or 0)
-    except Exception:
-        pass
+    if dex_available():
+        try:
+            r = requests.get(
+                f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                timeout=3
+            )
+            if r.status_code == 200:
+                pairs = r.json().get("pairs", [])
+                if pairs:
+                    return float(pairs[0].get("priceUsd", 0) or 0)
+            elif r.status_code == 429:
+                dex_mark_limited()
+        except Exception:
+            pass
     return None
 
 
