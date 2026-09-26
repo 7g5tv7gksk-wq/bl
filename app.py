@@ -39,7 +39,10 @@ STOP_LOSS_PCT        = 0.12
 BLACKLIST_COOLDOWN   = 7200   # 2 hours after a stop-loss
 MAX_POSITIONS        = 1
 LOOP_INTERVAL        = 15     # seconds between scan cycles
-OHLCV_TTL            = 300    # seconds between GeckoTerminal refreshes (5 min = 1 candle)
+OHLCV_TTL            = 300    # seconds between GeckoTerminal refreshes once we HAVE candles (5 min = 1 candle)
+OHLCV_RETRY_COOLDOWN = 45     # seconds between retries when a fetch failed/rate-limited — short
+                               # enough to pick up newly-indexed pools quickly, long enough that
+                               # a rate-limited or not-yet-indexed pool doesn't get hit every 15s cycle
 
 # Familiars (set FAMILIARS_API_KEY env var after registering at familiars.family)
 FAMILIARS_KEY = os.environ.get("FAMILIARS_API_KEY", "")
@@ -164,8 +167,12 @@ def fetch_ohlcv(pool_address, agg_min=5, limit=200):
         if r.status_code == 404:
             return []      # Pool not indexed yet — very new pair, fall back to momentum
         if r.status_code == 429:
-            logging.warning("⚠️ [GECKO] Rate limited — waiting 10s")
-            time.sleep(10)
+            # Do NOT block the shared bot thread here — a synchronous sleep
+            # inside this function freezes the entire scan loop (SOL regime
+            # check, other trackers, everything) for as long as we wait.
+            # Just log and return; the tracker's own retry cooldown
+            # (OHLCV_RETRY_COOLDOWN) handles spacing out the next attempt.
+            logging.warning(f"⚠️ [GECKO] Rate limited on {pool_address[:8]}…")
             return []
         if r.status_code != 200:
             return []
@@ -335,16 +342,25 @@ class CoinMarkovTracker:
         return min((self.windows - MIN_WINDOWS) / (MIN_WINDOWS * 3), 1.0)
 
     def refresh(self):
-        """Pull latest candles and recompute the Markov signal. No-op if TTL hasn't passed."""
-        if time.time() - self.last_fetch < OHLCV_TTL:
+        """
+        Pull latest candles and recompute the Markov signal.
+        Uses OHLCV_TTL between refreshes once we have working candle data
+        (5m candles only update every 5 min anyway, no point polling faster).
+        Uses the shorter OHLCV_RETRY_COOLDOWN when we DON'T have candles yet
+        (still-indexing pool or a rate limit) — retries reasonably soon
+        without hammering the API every single 15s scan cycle.
+        """
+        ttl = OHLCV_TTL if self.candles else OHLCV_RETRY_COOLDOWN
+        if time.time() - self.last_fetch < ttl:
             return
 
         candles = fetch_ohlcv(self.pair_address)
-        if not candles:
-            return    # Pool not indexed yet — keep existing signal (or None)
+        self.last_fetch = time.time()   # stamp the attempt whether it succeeded or not
 
-        self.candles    = candles
-        self.last_fetch = time.time()
+        if not candles:
+            return    # Pool not indexed yet or rate-limited — retry after cooldown
+
+        self.candles = candles
 
         states, bull_t, bear_t = _label_states(
             candles, STRIDE_BARS, ATR_BULL_MULT, ATR_BEAR_MULT
@@ -778,11 +794,23 @@ def run_bot():
                     "stickiness": tracker.stickiness if tracker.ready else None,
                 })
 
-            # Pass 2 — rank qualifying candidates best-signal-first
+            # Pass 2 — rank qualifying candidates.
+            # IMPORTANT: Markov signal is bounded to [-1, +1] by construction
+            # (it's a probability differential). Momentum signal is NOT bounded
+            # — it can read -3 or +3 depending on how sharp the move was. Sorting
+            # both on raw signal value would let a noisy cold-start momentum
+            # read (e.g. +2.5) outrank a real, statistically-grounded Markov
+            # signal (e.g. +0.35), which is backwards: Markov is the trusted
+            # layer, momentum is only a stand-in until enough history exists.
+            # So we sort in two tiers: all Markov-ready candidates first
+            # (by signal, strongest first), then momentum-only candidates
+            # (by signal, strongest first).
             if candidates:
-                candidates.sort(key=lambda c: c["signal"], reverse=True)
+                candidates.sort(key=lambda c: (c["ready"], c["signal"]), reverse=True)
                 top = " | ".join(
-                    f"${c['symbol']} {c['signal']:+.3f}" for c in candidates[:5]
+                    f"${c['symbol']} {c['signal']:+.3f}"
+                    f"{'[M]' if c['ready'] else '[mom]'}"
+                    for c in candidates[:5]
                 )
                 logging.info(
                     f"🏆 [RANKING] {len(candidates)} qualified this cycle | Top: {top}"
