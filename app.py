@@ -28,49 +28,47 @@ ATR_BEAR_MULT = 0.5           # Window return < -0.5×ATR% → BEAR
 MARKOV_THRESHOLD   = 0.20     # P(bull) − P(bear) required to enter via Markov layer
 MOMENTUM_THRESHOLD = 0.25     # Threshold for cold-start momentum fallback
 
-# SOL macro regime (simple % change rules — no extra API needed)
-SOL_BEAR_H24  = -15.0
-SOL_BULL_H24  =  10.0
-SOL_USDC_PAIR = "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ"   # Raydium SOL/USDC
+# SOL macro regime — now read straight from Jupiter's own token stats for the
+# native SOL mint, no separate pair address needed.
+SOL_BEAR_H24 = -15.0
+SOL_BULL_H24 =  10.0
+SOL_MINT     = "So11111111111111111111111111111111111111112"
 
 # Position management
 TAKE_PROFIT_PCT      = 0.35
 STOP_LOSS_PCT        = 0.12
 BLACKLIST_COOLDOWN   = 7200   # 2 hours after a stop-loss
+SECURITY_REJECT_COOLDOWN = 14400  # 4 hours after a RugCheck/GMGN fail — mint/freeze
+                                    # authority and holder concentration rarely change
+                                    # quickly, so re-checking every cycle just burns calls
 MAX_POSITIONS        = 1
 LOOP_INTERVAL        = 15     # seconds between scan cycles
 OHLCV_TTL            = 300    # seconds between GeckoTerminal refreshes once we HAVE candles (5 min = 1 candle)
-OHLCV_RETRY_COOLDOWN = 45     # seconds between retries when a fetch failed/rate-limited — short
-                               # enough to pick up newly-indexed pools quickly, long enough that
-                               # a rate-limited or not-yet-indexed pool doesn't get hit every 15s cycle
+OHLCV_RETRY_COOLDOWN = 45     # seconds between retries when a fetch/pool-resolution failed or was
+                               # rate-limited — short enough to pick up newly-indexed pools quickly,
+                               # long enough not to hammer the API every single 15s scan cycle
+TRACKER_STALE_SECONDS = 3600   # prune a coin's tracker if we haven't seen it in ANY cycle's
+                                # candidate list for this long (and it isn't an open position) —
+                                # without this, coin_trackers grows forever (every coin ever
+                                # scanned keeps getting refreshed and cached indefinitely, even
+                                # after it permanently drops out of Jupiter's recent/trending
+                                # lists), which is a real memory leak on a memory-capped host
 
 # Familiars (set FAMILIARS_API_KEY env var after registering at familiars.family)
 FAMILIARS_KEY = os.environ.get("FAMILIARS_API_KEY", "")
 FAMILIARS_URL = "https://familiars.family"
+
+JUP_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 # =====================================================================
 # STATE
 # =====================================================================
 active_positions  = {}    # mint → {symbol, entry_price}
 stopped_out_tokens= {}    # mint → timestamp of stop-out
+security_rejected = {}    # mint → timestamp of RugCheck/GMGN rejection
 coin_trackers     = {}    # mint → CoinMarkovTracker
 trade_stats = {"total_closed": 0, "wins": 0, "losses": 0, "net_sol_pnl": 0.0}
 _sol_cache = {"state": "SIDEWAYS", "last_check": 0}
-
-# DexScreener is a shared public API and Render's egress IPs get rate-limited
-# under real load (confirmed in production logs — 429s on both DexScreener
-# endpoints, back to back, cycle after cycle). ALL DexScreener call sites
-# (candidate scraper, batch pair fetch, price fallback) share this single
-# backoff so one 429 anywhere stops hammering the domain everywhere, instead
-# of each call site tripping and retrying independently.
-_dex_backoff = {"until": 0}
-DEX_BACKOFF_SECONDS = 30
-
-def dex_available():
-    return time.time() >= _dex_backoff["until"]
-
-def dex_mark_limited():
-    _dex_backoff["until"] = time.time() + DEX_BACKOFF_SECONDS
 
 # Markov state constants
 BULL, SIDEWAYS, BEAR = 0, 1, 2
@@ -126,8 +124,8 @@ def familiars_limits():
 
 # =====================================================================
 # LAYER 1 — SOL MACRO REGIME
-# Uses DexScreener % changes on SOL/USDC (free, no key, cached 5 min).
-# If SOL is in freefall the bot sits out entirely.
+# Reads Jupiter's own rolling stats for the SOL mint directly — no separate
+# pair address needed, same Token API v2 schema as everything else now.
 # =====================================================================
 def get_sol_regime():
     """Returns "BULL" | "SIDEWAYS" | "BEAR". Cached for OHLCV_TTL seconds."""
@@ -137,26 +135,32 @@ def get_sol_regime():
 
     try:
         r = requests.get(
-            f"https://api.dexscreener.com/latest/dex/pairs/solana/{SOL_USDC_PAIR}",
-            timeout=5
+            f"https://api.jup.ag/tokens/v2/search?query={SOL_MINT}",
+            headers=JUP_HEADERS, timeout=5
         )
         if r.status_code == 200:
-            pc = r.json().get("pair", {}).get("priceChange", {})
-            h24 = float(pc.get("h24", 0) or 0)
-            h6  = float(pc.get("h6",  0) or 0)
-            h1  = float(pc.get("h1",  0) or 0)
-
-            if h24 <= SOL_BEAR_H24 or (h6 <= -10 and h1 <= -5):
-                state = "BEAR"
-            elif h24 >= SOL_BULL_H24 and h6 >= 5:
-                state = "BULL"
-            else:
-                state = "SIDEWAYS"
-
-            _sol_cache.update({"state": state, "last_check": now})
-            logging.info(
-                f"🌐 [SOL MACRO] {state} | 24h={h24:+.1f}%  6h={h6:+.1f}%  1h={h1:+.1f}%"
+            data = r.json()
+            items = data if isinstance(data, list) else (data.get("data") or data.get("tokens") or [])
+            token = next(
+                (t for t in items if (t.get("id") or t.get("address") or t.get("mint")) == SOL_MINT),
+                None
             )
+            if token:
+                h24 = float((token.get("stats24h") or {}).get("priceChange") or 0)
+                h6  = float((token.get("stats6h")  or {}).get("priceChange") or 0)
+                h1  = float((token.get("stats1h")  or {}).get("priceChange") or 0)
+
+                if h24 <= SOL_BEAR_H24 or (h6 <= -10 and h1 <= -5):
+                    state = "BEAR"
+                elif h24 >= SOL_BULL_H24 and h6 >= 5:
+                    state = "BULL"
+                else:
+                    state = "SIDEWAYS"
+
+                _sol_cache.update({"state": state, "last_check": now})
+                logging.info(
+                    f"🌐 [SOL MACRO] {state} | 24h={h24:+.1f}%  6h={h6:+.1f}%  1h={h1:+.1f}%"
+                )
     except Exception as e:
         logging.error(f"❌ [SOL REGIME] {e}")
 
@@ -164,13 +168,13 @@ def get_sol_regime():
 
 
 # =====================================================================
-# OHLCV — GECKOTERMINAL  (free, keyless)
+# OHLCV — GECKOTERMINAL  (free, keyless) — still the only source with actual
+# historical candle series; Jupiter's stats are snapshots, not a time series.
 # =====================================================================
 def fetch_ohlcv(pool_address, agg_min=5, limit=200):
     """
     Fetch 5m OHLCV candles for a Solana pool from GeckoTerminal.
     Returns list[dict] oldest-first, or [] if pool not yet indexed.
-    DexScreener pairAddress == GeckoTerminal pool address for Raydium/Orca.
     """
     url = (
         f"https://api.geckoterminal.com/api/v2/networks/solana"
@@ -185,8 +189,6 @@ def fetch_ohlcv(pool_address, agg_min=5, limit=200):
             # Do NOT block the shared bot thread here — a synchronous sleep
             # inside this function freezes the entire scan loop (SOL regime
             # check, other trackers, everything) for as long as we wait.
-            # Just log and return; the tracker's own retry cooldown
-            # (OHLCV_RETRY_COOLDOWN) handles spacing out the next attempt.
             logging.warning(f"⚠️ [GECKO] Rate limited on {pool_address[:8]}…")
             return []
         if r.status_code != 200:
@@ -208,8 +210,35 @@ def fetch_ohlcv(pool_address, agg_min=5, limit=200):
         return []
 
 
+def resolve_pool_address(mint, graduated_pool_hint=None):
+    """
+    GeckoTerminal's OHLCV endpoint needs a POOL address, not a mint address.
+    Jupiter's token object gives us `graduatedPool` for free once a pump.fun
+    token has graduated to a full AMM pool — use that with zero extra calls.
+    Otherwise, ask GeckoTerminal directly which pool(s) trade this mint and
+    take the most liquid one (their tokens/{address}/pools endpoint, already
+    ranked by liquidity + volume).
+    """
+    if graduated_pool_hint:
+        return graduated_pool_hint
+
+    url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}/pools"
+    try:
+        r = requests.get(url, headers={"Accept": "application/json"}, timeout=8)
+        if r.status_code == 200:
+            data = r.json().get("data", [])
+            if data:
+                return data[0].get("attributes", {}).get("address")
+        elif r.status_code == 429:
+            logging.warning(f"⚠️ [GECKO POOL] Rate limited resolving pool for {mint[:8]}…")
+    except Exception as e:
+        logging.error(f"❌ [GECKO POOL] {mint[:8]}…: {e}")
+    return None
+
+
 # =====================================================================
 # MARKOV 2.0 ENGINE — THREE FIXES IMPLEMENTED
+# (unchanged — operates purely on candle data regardless of where it came from)
 # =====================================================================
 
 def _atr_pct(candles, period=14):
@@ -287,7 +316,7 @@ def _verify_labels(states, candles, stride):
     FIX 2 — Label verification.
 
     After building any matrix, self-check the state labels against
-    three known windows (first, middle, last).  A large positive return
+    three known windows (first, middle, last). A large positive return
     labelled BEAR — or vice versa — means the threshold calibration is off.
     Logs a warning; the engine continues but flags lower confidence.
     """
@@ -312,7 +341,7 @@ def _verify_labels(states, candles, stride):
 def _markov_signal(matrix, current_state):
     """
     Signal = P(BULL tomorrow | current state) − P(BEAR tomorrow | current state).
-    Range: −1.0 to +1.0.  Positive = bullish conviction.
+    Range: −1.0 to +1.0. Positive = bullish conviction.
     """
     return round(matrix[current_state][BULL] - matrix[current_state][BEAR], 4)
 
@@ -327,19 +356,22 @@ class CoinMarkovTracker:
     The bot falls back to the momentum signal in the meantime.
     """
 
-    def __init__(self, mint, pair_address, symbol):
-        self.mint         = mint
-        self.pair_address = pair_address
-        self.symbol       = symbol
-        self.candles      = []
-        self.states       = []
-        self.matrix       = None
-        self.stickiness   = None
-        self.signal       = None
-        self.current_state= SIDEWAYS
-        self.windows      = 0
-        self.last_fetch   = 0
-        self.verified     = False
+    def __init__(self, mint, symbol, graduated_pool_hint=None):
+        self.mint            = mint
+        self.symbol          = symbol
+        self.graduated_pool_hint = graduated_pool_hint
+        self.pool_address    = None
+        self.pool_last_try   = 0
+        self.candles         = []
+        self.states          = []
+        self.matrix          = None
+        self.stickiness      = None
+        self.signal          = None
+        self.current_state   = SIDEWAYS
+        self.windows         = 0
+        self.last_fetch       = 0
+        self.verified         = False
+        self.last_seen        = time.time()   # updated whenever this mint appears in a scan cycle
 
     @property
     def ready(self):
@@ -358,18 +390,28 @@ class CoinMarkovTracker:
 
     def refresh(self):
         """
-        Pull latest candles and recompute the Markov signal.
-        Uses OHLCV_TTL between refreshes once we have working candle data
-        (5m candles only update every 5 min anyway, no point polling faster).
-        Uses the shorter OHLCV_RETRY_COOLDOWN when we DON'T have candles yet
-        (still-indexing pool or a rate limit) — retries reasonably soon
-        without hammering the API every single 15s scan cycle.
+        First resolve a pool address if we don't have one yet (free if the
+        token already graduated on pump.fun; otherwise one GeckoTerminal
+        lookup, retried on OHLCV_RETRY_COOLDOWN so it doesn't hammer the API
+        every single 15s cycle while waiting).
+
+        Then pull candles on OHLCV_TTL once we have working data, or
+        OHLCV_RETRY_COOLDOWN while we don't (still-indexing pool or a
+        rate limit).
         """
+        if not self.pool_address:
+            if time.time() - self.pool_last_try < OHLCV_RETRY_COOLDOWN:
+                return
+            self.pool_last_try = time.time()
+            self.pool_address = resolve_pool_address(self.mint, self.graduated_pool_hint)
+            if not self.pool_address:
+                return    # Still no pool — retry after cooldown
+
         ttl = OHLCV_TTL if self.candles else OHLCV_RETRY_COOLDOWN
         if time.time() - self.last_fetch < ttl:
             return
 
-        candles = fetch_ohlcv(self.pair_address)
+        candles = fetch_ohlcv(self.pool_address)
         self.last_fetch = time.time()   # stamp the attempt whether it succeeded or not
 
         if not candles:
@@ -401,162 +443,86 @@ class CoinMarkovTracker:
 
 
 # =====================================================================
-# CANDIDATE SCRAPER  (multi-source, rate-limit safe)
+# CANDIDATE DISCOVERY — JUPITER TOKEN API V2 ONLY
+# Both scraping AND market data come from the same call now: Jupiter's
+# discovery endpoints return full token objects (liquidity, mcap, volume,
+# price change, buy/sell counts, mint/freeze authority) — no separate
+# batch pair-data fetch needed like the old DexScreener pipeline required.
 # =====================================================================
-def fetch_organic_candidates():
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    mints = []
-    source_report = []   # per-source diagnostic: (label, count_added, note)
+def fetch_jupiter_candidates():
+    """Returns dict: {mint: token_object}."""
+    token_map = {}
+    source_report = []
 
-    # Source A: DexScreener trending SOL search
-    if dex_available():
+    sources = [
+        ("recent",     "https://api.jup.ag/tokens/v2/recent"),
+        ("trending5m", "https://api.jup.ag/tokens/v2/toptrending/5m"),
+    ]
+
+    for label, url in sources:
         try:
-            r = requests.get(
-                "https://api.dexscreener.com/latest/dex/search?q=sol",
-                headers=headers, timeout=5
-            )
+            r = requests.get(url, headers=JUP_HEADERS, timeout=5)
             if r.status_code == 200:
-                before = len(mints)
-                for p in r.json().get("pairs", [])[:20]:
-                    if p.get("chainId") == "solana":
-                        addr = p.get("baseToken", {}).get("address")
-                        if addr and addr not in mints:
-                            mints.append(addr)
-                source_report.append(("DexA", len(mints) - before, "ok"))
-            elif r.status_code == 429:
-                dex_mark_limited()
-                source_report.append(("DexA", 0, "HTTP 429→backoff"))
-            else:
-                source_report.append(("DexA", 0, f"HTTP {r.status_code}"))
-        except Exception as e:
-            source_report.append(("DexA", 0, f"exc: {e}"))
-    else:
-        source_report.append(("DexA", 0, "skipped(backoff)"))
-
-    # Source B: Jupiter recent mints V2
-    # NOTE: current Jupiter Token API v2 endpoints wrap results as
-    # {"data": [...]}, not a bare list or {"tokens": [...]} — that mismatch
-    # was silently returning 0 items every cycle despite HTTP 200.
-    try:
-        r = requests.get(
-            "https://api.jup.ag/tokens/v2/recent",
-            headers=headers, timeout=5
-        )
-        if r.status_code == 200:
-            before = len(mints)
-            data = r.json()
-            if isinstance(data, list):
-                items = data
-            elif isinstance(data, dict):
-                items = data.get("data") or data.get("tokens") or []
-            else:
-                items = []
-            for item in items[:20]:
-                addr = item.get("address") or item.get("mint") or item.get("id")
-                if addr and addr not in mints:
-                    mints.append(addr)
-            added = len(mints) - before
-            if added:
-                note = "ok"
-            else:
-                shape = list(data.keys()) if isinstance(data, dict) else "list"
-                note = f"0 items, keys={shape}"
-            source_report.append(("Jupiter", added, note))
-        else:
-            source_report.append(("Jupiter", 0, f"HTTP {r.status_code}"))
-    except Exception as e:
-        source_report.append(("Jupiter", 0, f"exc: {e}"))
-
-    # Source C: DexScreener token profiles (fallback if A+B thin)
-    if len(mints) < 10:
-        if dex_available():
-            try:
-                r = requests.get(
-                    "https://api.dexscreener.com/token-profiles/latest/v1",
-                    headers=headers, timeout=5
-                )
-                if r.status_code == 200:
-                    before = len(mints)
-                    for item in r.json()[:20]:
-                        if item.get("chainId") == "solana":
-                            addr = item.get("tokenAddress")
-                            if addr and addr not in mints:
-                                mints.append(addr)
-                    source_report.append(("DexC", len(mints) - before, "ok"))
-                elif r.status_code == 429:
-                    dex_mark_limited()
-                    source_report.append(("DexC", 0, "HTTP 429→backoff"))
+                before = len(token_map)
+                data = r.json()
+                if isinstance(data, list):
+                    items = data
+                elif isinstance(data, dict):
+                    items = data.get("data") or data.get("tokens") or []
                 else:
-                    source_report.append(("DexC", 0, f"HTTP {r.status_code}"))
-            except Exception as e:
-                source_report.append(("DexC", 0, f"exc: {e}"))
-        else:
-            source_report.append(("DexC", 0, "skipped(backoff)"))
-    else:
-        source_report.append(("DexC", 0, "skipped(A+B sufficient)"))
+                    items = []
+                for item in items[:20]:
+                    addr = item.get("address") or item.get("mint") or item.get("id")
+                    if addr and addr not in token_map:
+                        token_map[addr] = item
+                added = len(token_map) - before
+                if added:
+                    note = "ok"
+                else:
+                    shape = list(data.keys()) if isinstance(data, dict) else "list"
+                    note = f"0 items, keys={shape}"
+                source_report.append((label, added, note))
+            elif r.status_code == 429:
+                source_report.append((label, 0, "HTTP 429"))
+            else:
+                source_report.append((label, 0, f"HTTP {r.status_code}"))
+        except Exception as e:
+            source_report.append((label, 0, f"exc: {e}"))
 
-    # One-line breakdown of what each source actually contributed this cycle —
-    # makes it possible to see WHICH source is going quiet, and why (rate
-    # limited vs empty response vs skipped), instead of just a final count.
     breakdown = " | ".join(f"{label}:{count}({note})" for label, count, note in source_report)
-    logging.info(f"📡 [SCRAPER] {len(mints[:30])} candidate mints | {breakdown}")
-    return mints[:30]
+    logging.info(f"📡 [SCRAPER] {len(token_map)} candidate tokens | {breakdown}")
+    return token_map
 
 
 # =====================================================================
-# BATCH DEX DATA  (single DexScreener call for up to 30 mints)
+# TOKEN FILTERS  (Jupiter Token API v2 schema)
 # =====================================================================
-def fetch_dex_batch(mints):
-    if not mints:
-        return {}
-    if not dex_available():
-        logging.info("⏸️ [DEX BATCH] Skipped — DexScreener backoff active, no pair data this cycle")
-        return {}   # respect the shared backoff — don't hammer while cooling down
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(mints[:30])}"
-    try:
-        r = requests.get(url, timeout=8)
-        if r.status_code == 200:
-            pair_map = {}
-            for p in r.json().get("pairs", []) or []:
-                addr = p.get("baseToken", {}).get("address")
-                if addr and addr not in pair_map:
-                    pair_map[addr] = p
-            return pair_map
-        if r.status_code == 429:
-            # Same class of bug as the earlier GeckoTerminal fix: a blocking
-            # sleep here freezes the whole shared bot loop. Just mark the
-            # shared backoff and return — no sleep.
-            dex_mark_limited()
-            logging.warning("⚠️ [DEX BATCH] 429 → backoff set, no pair data this cycle")
-    except Exception as e:
-        logging.error(f"❌ [DEX BATCH] {e}")
-    return {}
-
-
-# =====================================================================
-# PAIR FILTERS
-# =====================================================================
-def validate_pair(pair):
+def validate_token(token):
     """Enforces liquidity, MC band, volume, drawdown, and buy/sell ratio."""
-    if not pair:
+    if not token:
         return False
-    liq = float(pair.get("liquidity", {}).get("usd", 0) or 0)
+    liq = float(token.get("liquidity") or 0)
     if liq < MIN_LIQUIDITY_USD:
         return False
-    mc = float(pair.get("marketCap") or pair.get("fdv", 0) or 0)
+    mc = float(token.get("mcap") or token.get("fdv") or 0)
     if mc < MIN_MARKET_CAP or mc > MAX_MARKET_CAP:
         return False
-    v5m = float(pair.get("volume", {}).get("m5", 0) or 0)
-    if v5m < MIN_5M_VOLUME:
+
+    stats5m  = token.get("stats5m")  or {}
+    stats6h  = token.get("stats6h")  or {}
+    stats24h = token.get("stats24h") or {}
+
+    vol5m = float(stats5m.get("buyVolume") or 0) + float(stats5m.get("sellVolume") or 0)
+    if vol5m < MIN_5M_VOLUME:
         return False
-    pc = pair.get("priceChange", {})
-    if float(pc.get("h6",  0) or 0) < MAX_MACRO_DRAWDOWN:
+
+    if float(stats6h.get("priceChange")  or 0) < MAX_MACRO_DRAWDOWN:
         return False
-    if float(pc.get("h24", 0) or 0) < MAX_MACRO_DRAWDOWN:
+    if float(stats24h.get("priceChange") or 0) < MAX_MACRO_DRAWDOWN:
         return False
-    txns = pair.get("txns", {}).get("m5", {})
-    buys  = int(txns.get("buys",  0) or 0)
-    sells = int(txns.get("sells", 0) or 0)
+
+    buys  = int(stats5m.get("numBuys")  or 0)
+    sells = int(stats5m.get("numSells") or 0)
     if (buys + sells) < 12 or buys < (sells * 1.2):
         return False
     return True
@@ -564,36 +530,40 @@ def validate_pair(pair):
 
 # =====================================================================
 # LAYER 2 — MOMENTUM SIGNAL  (cold-start fallback)
-# Used when GeckoTerminal hasn't indexed the pair yet or data < MIN_WINDOWS.
-# This is the original compute_markov_differential, renamed to be honest.
+# Used when GeckoTerminal hasn't indexed the pool yet or data < MIN_WINDOWS.
 # =====================================================================
-def compute_momentum_signal(pair):
+def compute_momentum_signal(token):
     """
-    Velocity-acceleration signal built from DexScreener snapshot % changes.
-    Works on any pair immediately with no OHLCV history.
+    Velocity-acceleration signal built from Jupiter's rolling stats.
+    Works on any token immediately with no OHLCV history.
     Returns float signal or None (rejects anti-top-blast conditions).
     """
-    pc  = pair.get("priceChange", {})
-    m5  = float(pc.get("m5",  0) or 0)
-    h1  = float(pc.get("h1",  0) or 0)
-    h6  = float(pc.get("h6",  0) or 0)
+    stats5m = token.get("stats5m") or {}
+    stats1h = token.get("stats1h") or {}
+    stats6h = token.get("stats6h") or {}
+
+    m5 = float(stats5m.get("priceChange") or 0)
+    h1 = float(stats1h.get("priceChange") or 0)
+    h6 = float(stats6h.get("priceChange") or 0)
 
     if h1 > 50 or m5 > 30:
         return None   # Anti-top-blast: already ripping — skip
 
-    v_m5 = m5  / 5.0
-    v_h1 = h1  / 60.0
-    v_h6 = h6  / 360.0
+    v_m5 = m5 / 5.0
+    v_h1 = h1 / 60.0
+    v_h6 = h6 / 360.0
 
     delta_v   = v_m5 - v_h1
     stability = 1.0 if abs(v_h1 - v_h6) < 0.5 else 0.5
     S = (delta_v * 0.6 + v_m5 * 0.4) * stability
-    vol_wt = min(max(float(pair.get("volume", {}).get("m5", 0) or 0) / 1000.0, 0.5), 1.5)
+
+    vol5m  = float(stats5m.get("buyVolume") or 0) + float(stats5m.get("sellVolume") or 0)
+    vol_wt = min(max(vol5m / 1000.0, 0.5), 1.5)
     return round(S * vol_wt, 2)
 
 
 # =====================================================================
-# SECURITY CHECKS
+# SECURITY CHECKS  (unchanged — independent of the data-source migration)
 # =====================================================================
 def check_gmgn(mint):
     """Reject if bundler cluster > 10% or rug ratio > 0.30."""
@@ -603,10 +573,10 @@ def check_gmgn(mint):
             headers={"User-Agent": "Mozilla/5.0"}, timeout=5
         )
         if r.status_code == 200:
-            token = r.json().get("data", {}).get("token", {})
-            if float(token.get("bundler_pct", 0) or 0) > 10:
+            tok = r.json().get("data", {}).get("token", {})
+            if float(tok.get("bundler_pct", 0) or 0) > 10:
                 return False
-            if float(token.get("rug_ratio",   0) or 0) > 0.30:
+            if float(tok.get("rug_ratio",   0) or 0) > 0.30:
                 return False
     except Exception:
         pass
@@ -635,7 +605,7 @@ def check_rugcheck(mint):
 
 
 # =====================================================================
-# REAL-TIME PRICE  (Jupiter V2 → DexScreener fallback)
+# REAL-TIME PRICE  (Jupiter Price API v2 → Jupiter Token API v2 fallback)
 # =====================================================================
 def get_price(mint):
     try:
@@ -646,20 +616,21 @@ def get_price(mint):
                 return float(p)
     except Exception:
         pass
-    if dex_available():
-        try:
-            r = requests.get(
-                f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                timeout=3
-            )
-            if r.status_code == 200:
-                pairs = r.json().get("pairs", [])
-                if pairs:
-                    return float(pairs[0].get("priceUsd", 0) or 0)
-            elif r.status_code == 429:
-                dex_mark_limited()
-        except Exception:
-            pass
+    try:
+        r = requests.get(
+            f"https://api.jup.ag/tokens/v2/search?query={mint}",
+            headers=JUP_HEADERS, timeout=3
+        )
+        if r.status_code == 200:
+            data = r.json()
+            items = data if isinstance(data, list) else (data.get("data") or data.get("tokens") or [])
+            for item in items:
+                if (item.get("address") or item.get("mint") or item.get("id")) == mint:
+                    p = item.get("usdPrice")
+                    if p:
+                        return float(p)
+    except Exception:
+        pass
     return None
 
 
@@ -746,11 +717,11 @@ def run_bot():
     """
     Three-layer entry logic:
 
-    Layer 1 — SOL macro regime (DexScreener, cached 5 min)
+    Layer 1 — SOL macro regime (Jupiter's own stats for the SOL mint, cached 5 min)
         BEAR → sit out this cycle entirely
 
     Layer 2 — Momentum signal (instant, no OHLCV needed)
-        Used during cold start or when GeckoTerminal hasn't indexed the pair yet
+        Used during cold start or when GeckoTerminal hasn't indexed the pool yet
 
     Layer 3 — Markov 2.0 signal (GeckoTerminal OHLCV, 4-bar stride, ATR-adaptive)
         Replaces Layer 2 once MIN_WINDOWS stride windows have accumulated
@@ -779,6 +750,20 @@ def run_bot():
                 time.sleep(LOOP_INTERVAL)
                 continue
 
+            # Prune trackers for coins we haven't seen in any candidate list for
+            # a while — without this, coin_trackers grows forever (every coin
+            # ever scanned keeps getting refreshed and cached, even long after
+            # it drops out of Jupiter's recent/trending rotation for good).
+            stale = [
+                mint for mint, tracker in coin_trackers.items()
+                if mint not in active_positions
+                and time.time() - tracker.last_seen > TRACKER_STALE_SECONDS
+            ]
+            for mint in stale:
+                del coin_trackers[mint]
+            if stale:
+                logging.info(f"🧹 [PRUNE] Dropped {len(stale)} stale tracker(s)")
+
             # Refresh Markov on coins already in our tracker pool
             for tracker in list(coin_trackers.values()):
                 tracker.refresh()
@@ -789,9 +774,10 @@ def run_bot():
                 f"Active={len(active_positions)}"
             )
 
-            # Scrape + batch fetch
-            mints    = fetch_organic_candidates()
-            pair_map = fetch_dex_batch(mints) if mints else {}
+            # Discovery — Jupiter gives us candidates AND their market data
+            # in the same call, so there's no separate batch-fetch step.
+            token_map = fetch_jupiter_candidates()
+            mints     = list(token_map.keys())
 
             # Pass 1 — evaluate every candidate in the batch and collect the
             # ones that clear their threshold. We don't enter yet: we want to
@@ -800,10 +786,11 @@ def run_bot():
             candidates = []
 
             # Tally WHY candidates drop out each cycle — without this, "no
-            # entries" and "no pair data at all" look identical in the logs.
+            # entries" and "no token data at all" look identical in the logs.
             tally = {
                 "total": len(mints), "in_position_or_blacklist": 0,
-                "no_pair_data": 0, "failed_pair_filters": 0,
+                "security_blacklist_skip": 0,
+                "no_token_data": 0, "failed_filters": 0,
                 "security_rejected": 0, "no_signal": 0,
                 "below_threshold": 0, "qualified": 0,
             }
@@ -820,34 +807,45 @@ def run_bot():
                         continue
                     del stopped_out_tokens[mint]
 
-                pair = pair_map.get(mint)
-                if not pair:
-                    tally["no_pair_data"] += 1
+                token = token_map.get(mint)
+                if not token:
+                    tally["no_token_data"] += 1
                     continue
-                if not validate_pair(pair):
-                    tally["failed_pair_filters"] += 1
+                if not validate_token(token):
+                    tally["failed_filters"] += 1
                     continue
 
-                symbol       = pair.get("baseToken", {}).get("symbol", "?")
-                pair_address = pair.get("pairAddress", "")
-                price        = float(pair.get("priceUsd", 0) or 0)
-                mc           = float(pair.get("marketCap") or pair.get("fdv", 0) or 0)
+                symbol              = token.get("symbol", "?")
+                graduated_pool_hint = token.get("graduatedPool")
+                price               = float(token.get("usdPrice") or 0)
+                mc                  = float(token.get("mcap") or token.get("fdv") or 0)
+
+                # Security blacklist check — skip re-querying RugCheck/GMGN for
+                # a mint we already know failed recently.
+                if mint in security_rejected:
+                    if time.time() - security_rejected[mint] < SECURITY_REJECT_COOLDOWN:
+                        tally["security_blacklist_skip"] += 1
+                        continue
+                    del security_rejected[mint]
 
                 # Security screen
                 if not check_rugcheck(mint):
                     logging.info(f"🛡️ [REJECTED] ${symbol} — RugCheck fail")
                     tally["security_rejected"] += 1
+                    security_rejected[mint] = time.time()
                     continue
                 if not check_gmgn(mint):
                     logging.info(f"🛡️ [REJECTED] ${symbol} — GMGN fail")
                     tally["security_rejected"] += 1
+                    security_rejected[mint] = time.time()
                     continue
 
                 # ── Layers 2 / 3: signal selection ──────────────────
                 if mint not in coin_trackers:
-                    coin_trackers[mint] = CoinMarkovTracker(mint, pair_address, symbol)
+                    coin_trackers[mint] = CoinMarkovTracker(mint, symbol, graduated_pool_hint)
 
                 tracker = coin_trackers[mint]
+                tracker.last_seen = time.time()   # still showing up in Jupiter's lists
                 tracker.refresh()
 
                 if tracker.ready:
@@ -857,7 +855,7 @@ def run_bot():
                     threshold  = MARKOV_THRESHOLD
                 else:
                     # Layer 2: momentum fallback (cold start)
-                    signal     = compute_momentum_signal(pair)
+                    signal     = compute_momentum_signal(token)
                     signal_src = f"Momentum(cold,w={tracker.windows})"
                     threshold  = MOMENTUM_THRESHOLD
 
@@ -884,14 +882,15 @@ def run_bot():
                 })
 
             # Always log the funnel — this is what tells us WHY a cycle
-            # produced no entries: no candidates, no market data (backoff),
-            # strict filters, security rejections, or just no signal yet.
+            # produced no entries: no candidates, no market data, strict
+            # filters, security rejections, or just no signal yet.
             if mints:
                 logging.info(
                     f"🔍 [FUNNEL] {tally['total']} candidates → "
                     f"skip={tally['in_position_or_blacklist']} | "
-                    f"no_pair_data={tally['no_pair_data']} | "
-                    f"failed_filters={tally['failed_pair_filters']} | "
+                    f"security_blacklist={tally['security_blacklist_skip']} | "
+                    f"no_token_data={tally['no_token_data']} | "
+                    f"failed_filters={tally['failed_filters']} | "
                     f"security_rejected={tally['security_rejected']} | "
                     f"no_signal={tally['no_signal']} | "
                     f"below_threshold={tally['below_threshold']} | "
@@ -933,8 +932,8 @@ def run_bot():
                 limits      = familiars_limits()
                 max_pos_usd = limits.get("maxPositionUsd")
                 if max_pos_usd:
-                    sol_price_est = 150    # rough estimate for limit check
-                    trade_usd = SOL_TRADE_SIZE * sol_price_est
+                    sol_price = get_price(SOL_MINT) or 150   # live price; rough fallback
+                    trade_usd = SOL_TRADE_SIZE * sol_price
                     if trade_usd > float(max_pos_usd):
                         logging.warning(
                             f"⛔ [LIMITS] Trade ~${trade_usd:.0f} "
