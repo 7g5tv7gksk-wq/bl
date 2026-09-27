@@ -53,6 +53,13 @@ TRACKER_STALE_SECONDS = 3600   # prune a coin's tracker if we haven't seen it in
                                 # scanned keeps getting refreshed and cached indefinitely, even
                                 # after it permanently drops out of Jupiter's recent/trending
                                 # lists), which is a real memory leak on a memory-capped host
+POOL_RESOLVE_MAX_ATTEMPTS = 5   # give up on a coin's pool after this many genuine "no pool
+                                # found" checks (~4 min at OHLCV_RETRY_COOLDOWN spacing) —
+                                # without this, a coin still on a pump.fun bonding curve (no
+                                # AMM pool yet, maybe never) gets retried forever, burning a
+                                # GeckoTerminal call every cycle for a check that can never
+                                # succeed. Momentum signal doesn't need a tracker at all, so
+                                # giving up costs nothing — only real Markov needs the pool.
 
 # Familiars (set FAMILIARS_API_KEY env var after registering at familiars.family)
 FAMILIARS_KEY = os.environ.get("FAMILIARS_API_KEY", "")
@@ -246,9 +253,14 @@ def resolve_pool_address(mint, graduated_pool_hint=None):
     Otherwise, ask GeckoTerminal directly which pool(s) trade this mint and
     take the most liquid one (their tokens/{address}/pools endpoint, already
     ranked by liquidity + volume).
+
+    Returns (pool_address_or_None, was_rate_limited). The caller uses
+    was_rate_limited to avoid penalizing a coin just because OUR OWN rate
+    limit tripped during the check — only a genuine "checked successfully,
+    no pool exists" result should count toward giving up on a coin.
     """
     if graduated_pool_hint:
-        return graduated_pool_hint
+        return graduated_pool_hint, False
 
     url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}/pools"
     try:
@@ -256,12 +268,15 @@ def resolve_pool_address(mint, graduated_pool_hint=None):
         if r.status_code == 200:
             data = r.json().get("data", [])
             if data:
-                return data[0].get("attributes", {}).get("address")
-        elif r.status_code == 429:
+                return data[0].get("attributes", {}).get("address"), False
+            return None, False    # Checked successfully — genuinely no pool (yet)
+        if r.status_code == 429:
             logging.warning(f"⚠️ [GECKO POOL] Rate limited resolving pool for {mint[:8]}…")
+            return None, True     # Transient — don't count against the give-up counter
+        return None, False        # Other error status — count it as a real check
     except Exception as e:
         logging.error(f"❌ [GECKO POOL] {mint[:8]}…: {e}")
-    return None
+        return None, True         # Network hiccup — transient, don't count
 
 
 # =====================================================================
@@ -390,6 +405,8 @@ class CoinMarkovTracker:
         self.graduated_pool_hint = graduated_pool_hint
         self.pool_address    = None
         self.pool_last_try   = 0
+        self.pool_resolve_attempts = 0
+        self.pool_abandoned  = False
         self.candles         = []
         self.states          = []
         self.matrix          = None
@@ -421,19 +438,35 @@ class CoinMarkovTracker:
         First resolve a pool address if we don't have one yet (free if the
         token already graduated on pump.fun; otherwise one GeckoTerminal
         lookup, retried on OHLCV_RETRY_COOLDOWN so it doesn't hammer the API
-        every single 15s cycle while waiting).
+        every single 15s cycle while waiting). Gives up after
+        POOL_RESOLVE_MAX_ATTEMPTS genuine "no pool" checks — a coin still on
+        a bonding curve may never have one, and momentum fallback doesn't
+        need this tracker at all, so continuing to retry forever is pure waste.
 
         Then pull candles on OHLCV_TTL once we have working data, or
         OHLCV_RETRY_COOLDOWN while we don't (still-indexing pool or a
         rate limit).
         """
+        if self.pool_abandoned:
+            return    # Gave up — no pool after several genuine checks; momentum-only forever
+
         if not self.pool_address:
             if time.time() - self.pool_last_try < OHLCV_RETRY_COOLDOWN:
                 return
             self.pool_last_try = time.time()
-            self.pool_address = resolve_pool_address(self.mint, self.graduated_pool_hint)
-            if not self.pool_address:
-                return    # Still no pool — retry after cooldown
+            addr, was_rate_limited = resolve_pool_address(self.mint, self.graduated_pool_hint)
+            if addr:
+                self.pool_address = addr
+            else:
+                if not was_rate_limited:
+                    self.pool_resolve_attempts += 1
+                    if self.pool_resolve_attempts >= POOL_RESOLVE_MAX_ATTEMPTS:
+                        self.pool_abandoned = True
+                        logging.info(
+                            f"📉 [POOL] Giving up on ${self.symbol} — "
+                            f"no pool after {self.pool_resolve_attempts} checks, momentum-only"
+                        )
+                return    # Still no pool — retry after cooldown (unless just abandoned)
 
         ttl = OHLCV_TTL if self.candles else OHLCV_RETRY_COOLDOWN
         if time.time() - self.last_fetch < ttl:
@@ -789,14 +822,14 @@ def run_bot():
                 time.sleep(LOOP_INTERVAL)
                 continue
 
-            # Prune trackers for coins we haven't seen in any candidate list for
-            # a while — without this, coin_trackers grows forever (every coin
-            # ever scanned keeps getting refreshed and cached, even long after
-            # it drops out of Jupiter's recent/trending rotation for good).
+            # Prune trackers we're done with: either genuinely stale (not seen
+            # in a candidate list for a while) or abandoned (gave up on ever
+            # finding a pool — no point keeping those around at all).
             stale = [
                 mint for mint, tracker in coin_trackers.items()
                 if mint not in active_positions
-                and time.time() - tracker.last_seen > TRACKER_STALE_SECONDS
+                and (tracker.pool_abandoned
+                     or time.time() - tracker.last_seen > TRACKER_STALE_SECONDS)
             ]
             for mint in stale:
                 del coin_trackers[mint]
