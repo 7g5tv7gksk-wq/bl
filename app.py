@@ -58,7 +58,31 @@ TRACKER_STALE_SECONDS = 3600   # prune a coin's tracker if we haven't seen it in
 FAMILIARS_KEY = os.environ.get("FAMILIARS_API_KEY", "")
 FAMILIARS_URL = "https://familiars.family"
 
-JUP_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+# Jupiter (optional — set JUPITER_API_KEY after signing up free at
+# https://developers.jup.ag/portal). Keyless requests share a 0.5 RPS bucket
+# with every other anonymous caller on the same IP — and Render's free-tier
+# IPs are shared across many unrelated services, so that shared bucket can
+# get exhausted by traffic that has nothing to do with this bot. A free key
+# gives this bot its own dedicated 1 RPS bucket instead.
+JUPITER_API_KEY = os.environ.get("JUPITER_API_KEY", "")
+JUP_BASE_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+def jup_headers():
+    h = dict(JUP_BASE_HEADERS)
+    if JUPITER_API_KEY:
+        h["x-api-key"] = JUPITER_API_KEY
+    return h
+
+# Shared backoff for Jupiter calls — one 429 anywhere pauses all Jupiter
+# calls for a bit instead of continuing to hammer it every 15s cycle.
+_jup_backoff = {"until": 0}
+JUP_BACKOFF_SECONDS = 30
+
+def jup_available():
+    return time.time() >= _jup_backoff["until"]
+
+def jup_mark_limited():
+    _jup_backoff["until"] = time.time() + JUP_BACKOFF_SECONDS
 
 # =====================================================================
 # STATE
@@ -132,12 +156,16 @@ def get_sol_regime():
     now = time.time()
     if now - _sol_cache["last_check"] < OHLCV_TTL:
         return _sol_cache["state"]
+    if not jup_available():
+        return _sol_cache["state"]
 
     try:
         r = requests.get(
             f"https://api.jup.ag/tokens/v2/search?query={SOL_MINT}",
-            headers=JUP_HEADERS, timeout=5
+            headers=jup_headers(), timeout=5
         )
+        if r.status_code == 429:
+            jup_mark_limited()
         if r.status_code == 200:
             data = r.json()
             items = data if isinstance(data, list) else (data.get("data") or data.get("tokens") or [])
@@ -460,8 +488,11 @@ def fetch_jupiter_candidates():
     ]
 
     for label, url in sources:
+        if not jup_available():
+            source_report.append((label, 0, "skipped(backoff)"))
+            continue
         try:
-            r = requests.get(url, headers=JUP_HEADERS, timeout=5)
+            r = requests.get(url, headers=jup_headers(), timeout=5)
             if r.status_code == 200:
                 before = len(token_map)
                 data = r.json()
@@ -483,7 +514,8 @@ def fetch_jupiter_candidates():
                     note = f"0 items, keys={shape}"
                 source_report.append((label, added, note))
             elif r.status_code == 429:
-                source_report.append((label, 0, "HTTP 429"))
+                jup_mark_limited()
+                source_report.append((label, 0, "HTTP 429→backoff"))
             else:
                 source_report.append((label, 0, f"HTTP {r.status_code}"))
         except Exception as e:
@@ -608,29 +640,36 @@ def check_rugcheck(mint):
 # REAL-TIME PRICE  (Jupiter Price API v2 → Jupiter Token API v2 fallback)
 # =====================================================================
 def get_price(mint):
-    try:
-        r = requests.get(f"https://api.jup.ag/price/v2?ids={mint}", timeout=2)
-        if r.status_code == 200:
-            p = r.json().get("data", {}).get(mint, {}).get("price")
-            if p:
-                return float(p)
-    except Exception:
-        pass
-    try:
-        r = requests.get(
-            f"https://api.jup.ag/tokens/v2/search?query={mint}",
-            headers=JUP_HEADERS, timeout=3
-        )
-        if r.status_code == 200:
-            data = r.json()
-            items = data if isinstance(data, list) else (data.get("data") or data.get("tokens") or [])
-            for item in items:
-                if (item.get("address") or item.get("mint") or item.get("id")) == mint:
-                    p = item.get("usdPrice")
-                    if p:
-                        return float(p)
-    except Exception:
-        pass
+    if jup_available():
+        try:
+            r = requests.get(f"https://api.jup.ag/price/v2?ids={mint}",
+                              headers=jup_headers(), timeout=2)
+            if r.status_code == 200:
+                p = r.json().get("data", {}).get(mint, {}).get("price")
+                if p:
+                    return float(p)
+            elif r.status_code == 429:
+                jup_mark_limited()
+        except Exception:
+            pass
+    if jup_available():
+        try:
+            r = requests.get(
+                f"https://api.jup.ag/tokens/v2/search?query={mint}",
+                headers=jup_headers(), timeout=3
+            )
+            if r.status_code == 200:
+                data = r.json()
+                items = data if isinstance(data, list) else (data.get("data") or data.get("tokens") or [])
+                for item in items:
+                    if (item.get("address") or item.get("mint") or item.get("id")) == mint:
+                        p = item.get("usdPrice")
+                        if p:
+                            return float(p)
+            elif r.status_code == 429:
+                jup_mark_limited()
+        except Exception:
+            pass
     return None
 
 
