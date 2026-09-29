@@ -1005,11 +1005,27 @@ def run_flask():
     app.run(host="0.0.0.0", port=port)
 
 
-# =====================================================================
-# ENTRY POINT
-# =====================================================================
-threading.Thread(target=run_monitor, daemon=True).start()
-threading.Thread(target=run_bot,     daemon=True).start()
+# ==============================================================================
+# FLASK HEALTH CHECK & SERVER ENTRY POINT
+# ==============================================================================
+app = Flask(__name__)
+
+@app.route("/")
+@app.route("/health")
+def health():
+    return f"Markov 2.0 Active | Positions={len(active_positions)} | Stats={trade_stats}", 200
+
+def run_flask():
+    import logging as _log
+    _log.getLogger("werkzeug").setLevel(_log.ERROR)
+
+    # Launch trading bot and monitor threads inside execution context
+    threading.Thread(target=run_monitor, daemon=True).start()
+    threading.Thread(target=run_bot, daemon=True).start()
+
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     run_flask()
+
