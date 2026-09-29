@@ -651,10 +651,14 @@ def check_rugcheck(mint):
 # REAL-TIME PRICE
 # =====================================================================
 def get_price(mint):
+    # 1. Try Jupiter Primary Price Endpoint
     if jup_available():
         try:
-            r = requests.get(f"https://api.jup.ag/price/v2?ids={mint}",
-                              headers=jup_headers(), timeout=2)
+            r = requests.get(
+                f"https://api.jup.ag/price/v2?ids={mint}",
+                headers=jup_headers(),
+                timeout=2
+            )
             if r.status_code == 200:
                 p = r.json().get("data", {}).get(mint, {}).get("price")
                 if p:
@@ -663,25 +667,43 @@ def get_price(mint):
                 jup_mark_limited()
         except Exception:
             pass
+
+    # 2. Try Jupiter Search API as Secondary Fallback
     if jup_available():
         try:
             r = requests.get(
                 f"https://api.jup.ag/tokens/v2/search?query={mint}",
-                headers=jup_headers(), timeout=3
+                headers=jup_headers(),
+                timeout=3
             )
             if r.status_code == 200:
                 data = r.json()
                 items = data if isinstance(data, list) else (data.get("data") or data.get("tokens") or [])
                 for item in items:
                     if (item.get("address") or item.get("mint") or item.get("id")) == mint:
-                        p = item.get("usdPrice")
+                        # Extract price from standard keys or stats dictionary
+                        p = item.get("price") or item.get("usdPrice") or item.get("stats24h", {}).get("price")
                         if p:
                             return float(p)
             elif r.status_code == 429:
                 jup_mark_limited()
         except Exception:
             pass
+
+    # 3. Emergency Fallback to DexScreener if Jupiter fails/rate-limits
+    try:
+        r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=3)
+        if r.status_code == 200:
+            pairs = r.json().get("pairs") or []
+            if pairs:
+                p = pairs[0].get("priceUsd")
+                if p:
+                    return float(p)
+    except Exception:
+        pass
+
     return None
+
 
 
 # =====================================================================
@@ -694,71 +716,111 @@ def run_monitor():
         heartbeat += 1
         try:
             if active_positions:
-                to_close   = []
-                pnl_lines  = []
-                for mint, info in list(active_positions.items()):
-                    price = get_price(mint)
-                    if not price or info["entry_price"] == 0:
+                to_close = []
+                pnl_lines = []
+                
+                # Safely copy keys to avoid dictionary mutation lockups across threads
+                for mint in list(active_positions.keys()):
+                    info = active_positions.get(mint)
+                    if not info:
                         continue
-                    entry  = info["entry_price"]
-                    symbol = info["symbol"]
-                    gross  = (price - entry) / entry
-                    net    = gross - 2 * FEE_SLIPPAGE_PCT
-                    size   = info.get("trade_size", SOL_TRADE_SIZE)
+                        
+                    price = get_price(mint)
+                    entry = info.get("entry_price", 0)
+                    
+                    # Skip if price fetch failed or entry price is invalid
+                    if not price or entry == 0:
+                        continue
+
+                    symbol = info.get("symbol", "UNKNOWN")
+                    gross = (price - entry) / entry
+                    net = gross - 2 * FEE_SLIPPAGE_PCT
+                    size = info.get("trade_size", SOL_TRADE_SIZE)
+
                     pnl_lines.append(
                         f"${symbol} {gross*100:+.1f}% gross / {net*100:+.1f}% net"
                     )
+
+                    # --- TAKE PROFIT ---
                     if gross >= TAKE_PROFIT_PCT:
                         net_sol = size * net
                         trade_stats["total_closed"] += 1
-                        trade_stats["wins"]         += 1
-                        trade_stats["net_sol_pnl"]  += net_sol
-                        wr = trade_stats["wins"] / trade_stats["total_closed"] * 100
+                        trade_stats["wins"] += 1
+                        trade_stats["net_sol_pnl"] += net_sol
+                        wr = (trade_stats["wins"] / trade_stats["total_closed"]) * 100
+
                         logging.info(
                             f"🎯 [TP] ${symbol} gross +{gross*100:.1f}% | "
                             f"net {net*100:.1f}% | +{net_sol:.4f} SOL | "
                             f"WR={wr:.1f}% | Net={trade_stats['net_sol_pnl']:+.4f} SOL"
                         )
+
                         risk_on_win()
-                        log_trade(symbol, mint, "TP", entry, price,
-                                  info.get("signal_src","?"), info.get("signal", 0))
-                        familiars_post(
-                            "trade",
-                            f"TP +{gross*100:.1f}% (net {net*100:.1f}%) on ${symbol}. "
-                            f"Net={trade_stats['net_sol_pnl']:+.4f} SOL",
-                            mint=mint
+                        log_trade(
+                            symbol, mint, "TP", entry, price,
+                            info.get("signal_src", "?"), info.get("signal", 0)
                         )
+
+                        # Non-blocking webhook call
+                        try:
+                            familiars_post(
+                                "trade",
+                                f"TP +{gross*100:.1f}% (net {net*100:.1f}%) on ${symbol}. "
+                                f"Net={trade_stats['net_sol_pnl']:+.4f} SOL",
+                                mint=mint
+                            )
+                        except Exception as post_err:
+                            logging.error(f"⚠️ [MONITOR] TP webhook error: {post_err}")
+
                         to_close.append(mint)
+
+                    # --- STOP LOSS ---
                     elif gross <= -STOP_LOSS_PCT:
                         net_sol = size * net
                         trade_stats["total_closed"] += 1
-                        trade_stats["losses"]        += 1
-                        trade_stats["net_sol_pnl"]   += net_sol
-                        wr = trade_stats["wins"] / trade_stats["total_closed"] * 100
+                        trade_stats["losses"] += 1
+                        trade_stats["net_sol_pnl"] += net_sol
+                        wr = (trade_stats["wins"] / trade_stats["total_closed"]) * 100
+
                         logging.info(
-                            f"🛑 [SL] ${symbol} gross {gross*100:.1f}% | "
+                            f"🔴 [SL] ${symbol} gross {gross*100:.1f}% | "
                             f"net {net*100:.1f}% | {net_sol:.4f} SOL | "
                             f"WR={wr:.1f}% | Net={trade_stats['net_sol_pnl']:+.4f} SOL"
                         )
+
                         risk_on_loss(abs(net_sol))
-                        log_trade(symbol, mint, "SL", entry, price,
-                                  info.get("signal_src","?"), info.get("signal", 0))
-                        familiars_post(
-                            "trade",
-                            f"SL {gross*100:.1f}% (net {net*100:.1f}%) on ${symbol}. "
-                            f"Blacklisting 2h.",
-                            mint=mint
+                        log_trade(
+                            symbol, mint, "SL", entry, price,
+                            info.get("signal_src", "?"), info.get("signal", 0)
                         )
+
+                        # Non-blocking webhook call
+                        try:
+                            familiars_post(
+                                "trade",
+                                f"SL {gross*100:.1f}% (net {net*100:.1f}%) on ${symbol}. "
+                                f"Blacklisting 2h.",
+                                mint=mint
+                            )
+                        except Exception as post_err:
+                            logging.error(f"⚠️ [MONITOR] SL webhook error: {post_err}")
+
                         stopped_out_tokens[mint] = time.time()
                         to_close.append(mint)
+
+                # Clean up closed positions
                 for mint in to_close:
                     active_positions.pop(mint, None)
                     coin_trackers.pop(mint, None)
+
                 if pnl_lines and heartbeat % 10 == 0:
                     logging.info("📟 [PNL] " + " | ".join(pnl_lines))
+
         except Exception as e:
             logging.error(f"❌ [MONITOR] {e}")
+
         time.sleep(1)
+
 
 
 # =====================================================================
