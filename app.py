@@ -100,6 +100,14 @@ def jup_headers():
 
 _jup_backoff = {"until": 0}
 JUP_BACKOFF_SECONDS = 30
+_gecko_backoff = {"until": 0}
+GECKO_BACKOFF_SECONDS = 60
+
+def gecko_available():
+    return time.time() >= _gecko_backoff["until"]
+
+def gecko_mark_limited():
+    _gecko_backoff["until"] = time.time() + GECKO_BACKOFF_SECONDS
 
 def jup_available():
     return time.time() >= _jup_backoff["until"]
@@ -114,6 +122,7 @@ active_positions  = {}
 stopped_out_tokens= {}
 security_rejected = {}
 coin_trackers     = {}
+_pool_cache = {}
 trade_stats = {"total_closed": 0, "wins": 0, "losses": 0, "net_sol_pnl": 0.0}
 _sol_cache = {"state": "SIDEWAYS", "last_check": 0}
 
@@ -124,8 +133,8 @@ risk_state = {
     "kill_switch":        False,
 }
 
-BULL, SIDEWAYS, BEAR = 0, 1, 2
-STATE_NAME = {BULL: "BULL", SIDEWAYS: "SIDEWAYS", BEAR: "BEAR"}
+BULL, BEAR, SIDEWAYS = 0, 1, 2
+STATE_NAME = {BULL: "BULL", BEAR: "BEAR", SIDEWAYS: "SIDEWAYS"}
 
 
 # =====================================================================
@@ -286,7 +295,11 @@ def get_sol_regime():
 # =====================================================================
 # OHLCV — GECKOTERMINAL
 # =====================================================================
+# --- NEW CODE ---
 def fetch_ohlcv(pool_address, agg_min=5, limit=200):
+    if not gecko_available():
+        return []
+
     url = (
         f"https://api.geckoterminal.com/api/v2/networks/solana"
         f"/pools/{pool_address}/ohlcv/minute"
@@ -297,7 +310,8 @@ def fetch_ohlcv(pool_address, agg_min=5, limit=200):
         if r.status_code == 404:
             return []
         if r.status_code == 429:
-            logging.warning(f"⚠️ [GECKO] Rate limited on {pool_address[:8]}…")
+            gecko_mark_limited()
+            logging.warning(f"⚠️ [GECKO] Rate limited on {pool_address[:8]}... backing off 60s")
             return []
         if r.status_code != 200:
             return []
@@ -317,21 +331,38 @@ def fetch_ohlcv(pool_address, agg_min=5, limit=200):
 def resolve_pool_address(mint, graduated_pool_hint=None):
     if graduated_pool_hint:
         return graduated_pool_hint, False
+
+    # 1. Check in-memory cache first to avoid hitting Gecko API
+    if mint in _pool_cache:
+        return _pool_cache[mint], False
+
+    # 2. Check backoff guard
+    if not gecko_available():
+        return None, True
+
     url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}/pools"
     try:
         r = requests.get(url, headers={"Accept": "application/json"}, timeout=8)
         if r.status_code == 200:
             data = r.json().get("data", [])
             if data:
-                return data[0].get("attributes", {}).get("address"), False
+                pool_addr = data[0].get("attributes", {}).get("address")
+                if pool_addr:
+                    _pool_cache[mint] = pool_addr  # Cache result
+                    return pool_addr, False
             return None, False
+
         if r.status_code == 429:
-            logging.warning(f"⚠️ [GECKO POOL] Rate limited resolving pool for {mint[:8]}…")
+            gecko_mark_limited()
+            logging.warning(f"⚠️ [GECKO POOL] Rate limited resolving pool for {mint[:8]}... backing off 60s")
             return None, True
+
         return None, False
+
     except Exception as e:
-        logging.error(f"❌ [GECKO POOL] {mint[:8]}…: {e}")
+        logging.error(f"❌ [GECKO POOL] {mint[:8]}...: {e}")
         return None, True
+
 
 
 # =====================================================================
@@ -373,7 +404,7 @@ def _build_matrix(states):
     for row in counts:
         total = sum(row)
         matrix.append([v / total if total else 1/3 for v in row])
-    stickiness = {STATE_NAME[s]: round(matrix[s][s], 3) for s in (BULL, SIDEWAYS, BEAR)}
+    stickiness = {STATE_NAME[s]: round(matrix[s][s], 3) for s in (BULL, BEAR, SIDEWAYS)}
     return matrix, stickiness
 
 def _verify_labels(states, candles, stride):
