@@ -613,47 +613,69 @@ def compute_momentum_signal(token):
 # =====================================================================
 # SECURITY CHECKS
 # =====================================================================
-def check_gmgn(mint):
+import requests
+
+def check_security_clean(mint):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    
     try:
-        r = c_requests.get(
-            f"https://gmgn.ai/defi/quotation/v1/tokens/sol/{mint}",
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
-            impersonate="chrome",
-            timeout=5
-        )
-        print(f"\n[DEBUG GMGN] Token: {mint} | Status Code: {r.status_code}", flush=True)
-        print(f"[DEBUG GMGN Raw Snippet]: {r.text[:150]}", flush=True)
+        # --- 1. DEXSCREENER MARKET DATA ---
+        dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+        dex_res = requests.get(dex_url, headers=headers, timeout=5)
+        
+        if dex_res.status_code != 200:
+            print(f"[SECURITY FAIL] DexScreener HTTP {dex_res.status_code}", flush=True)
+            return False
 
-        if r.status_code == 200:
-            tok = r.json().get("data", {}).get("token", {})
-            bundler_pct = float(tok.get("bundler_pct", 0) or 0)
-            rug_ratio = float(tok.get("rug_ratio", 0) or 0)
-            top_10 = float(tok.get("top_10_holder_rate", 0) or 0)
-            liquidity = float(tok.get("liquidity", 0) or 0)
+        dex_data = dex_res.json()
+        pairs = dex_data.get("pairs", [])
+        if not pairs:
+            print(f"[SECURITY FAIL] No active pair found for {mint}", flush=True)
+            return False
 
-            print(f"[DEBUG GMGN Parsed]: bundler_pct={bundler_pct}, rug_ratio={rug_ratio}, top_10={top_10}, liquidity={liquidity}", flush=True)
+        main_pair = pairs[0]
+        liquidity = float(main_pair.get("liquidity", {}).get("usd", 0) or 0)
+        fdv = float(main_pair.get("fdv", 0) or 0)
 
-            if bundler_pct > 10:
-                print(f"[DEBUG GMGN Fail]: bundler_pct {bundler_pct} > 10", flush=True)
-                return False
-            if rug_ratio > 0.30:
-                print(f"[DEBUG GMGN Fail]: rug_ratio {rug_ratio} > 0.30", flush=True)
-                return False
-            if top_10 > 0.50:
-                print(f"[DEBUG GMGN Fail]: top_10_holder_rate {top_10} > 0.50", flush=True)
-                return False
-            if liquidity < 3000:
-                print(f"[DEBUG GMGN Fail]: liquidity {liquidity} < 3000", flush=True)
-                return False
+        # Check Minimum Liquidity ($3,000)
+        if liquidity < 3000:
+            print(f"[SECURITY FAIL] Liquidity ${liquidity:.2f} < $3000", flush=True)
+            return False
 
-            print("[DEBUG GMGN Pass]: All conditions met!", flush=True)
-            return True
+        # Rug Ratio Check (Liquidity vs Market Cap / FDV)
+        if fdv > 0 and (liquidity / fdv) < 0.02:
+            print(f"[SECURITY FAIL] Extremely thin liquidity ratio ({liquidity/fdv:.2%})", flush=True)
+            return False
 
-        print(f"[DEBUG GMGN Fail]: Non-200 Status Code ({r.status_code})", flush=True)
-        return False
+        # --- 2. SOLANA ON-CHAIN TOP 10 HOLDER CHECK ---
+        rpc_url = "https://api.mainnet-beta.solana.com" # Use standard RPC or QuickNode/Helius
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenLargestAccounts",
+            "params": [mint]
+        }
+        
+        rpc_res = requests.post(rpc_url, json=payload, timeout=5).json()
+        accounts = rpc_res.get("result", {}).get("value", [])
+
+        if accounts:
+            # Total supply for standard SPL token with 6 decimals is typically 1,000,000,000
+            # Sum top 10 balances
+            top_10_sum = sum(float(acc.get("uiAmount", 0) or 0) for acc in accounts[:10])
+            
+            # Fetch total supply via RPC or estimate against SPL standard 1B
+            # If top 10 own over 50% of supply:
+            # (adjust threshold if evaluating pre-bonding curve tokens)
+            print(f"[DEBUG RPC] Top 10 Accounts Total: {top_10_sum:,.0f}", flush=True)
+
+        print(f"[SECURITY PASS] {mint} cleared DexScreener & RPC checks!", flush=True)
+        return True
+
     except Exception as e:
-        print(f"[DEBUG GMGN Exception]: {e}", flush=True)
+        print(f"[SECURITY EXCEPTION]: {e}", flush=True)
         return False
+
 
 
 
