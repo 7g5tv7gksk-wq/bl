@@ -613,39 +613,62 @@ def compute_momentum_signal(token):
 # =====================================================================
 # SECURITY CHECKS
 # =====================================================================
+import time
 import requests
 
 def check_gmgn(mint):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    
+    """
+    Evaluates token liquidity and basic safety using DexScreener API.
+    Includes a 0.25s delay to keep total requests under DexScreener rate limits.
+    """
+    # Pace requests (~4 per second) to stay under DexScreener's 300 req/min limit
+    time.sleep(0.25)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+
     try:
-        # --- 1. DEXSCREENER MARKET DATA ---
-        dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-        dex_res = requests.get(dex_url, headers=headers, timeout=5)
-        
-        if dex_res.status_code != 200:
-            print(f"[SECURITY FAIL] DexScreener HTTP {dex_res.status_code}", flush=True)
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+        res = requests.get(url, headers=headers, timeout=5)
+
+        if res.status_code == 429:
+            print(f"[SECURITY FAIL] DexScreener 429 Rate Limit hit for {mint}", flush=True)
             return False
 
-        dex_data = dex_res.json()
-        pairs = dex_data.get("pairs", [])
+        if res.status_code != 200:
+            print(f"[SECURITY FAIL] DexScreener Non-200 Status ({res.status_code}) for {mint}", flush=True)
+            return False
+
+        data = res.json()
+        pairs = data.get("pairs") or []
+
         if not pairs:
-            print(f"[SECURITY FAIL] No active pair found for {mint}", flush=True)
+            print(f"[SECURITY FAIL] No active pair found on DexScreener for {mint}", flush=True)
             return False
 
+        # Evaluate primary pair
         main_pair = pairs[0]
         liquidity = float(main_pair.get("liquidity", {}).get("usd", 0) or 0)
         fdv = float(main_pair.get("fdv", 0) or 0)
 
-        # Check Minimum Liquidity ($3,000)
+        # Minimum Liquidity Check ($3,000)
         if liquidity < 3000:
-            print(f"[SECURITY FAIL] Liquidity ${liquidity:.2f} < $3000", flush=True)
+            print(f"[SECURITY FAIL] {mint[:8]}... Low Liquidity (${liquidity:,.0f} < $3,000)", flush=True)
             return False
 
-        # Rug Ratio Check (Liquidity vs Market Cap / FDV)
-        if fdv > 0 and (liquidity / fdv) < 0.02:
-            print(f"[SECURITY FAIL] Extremely thin liquidity ratio ({liquidity/fdv:.2%})", flush=True)
+        # Basic Liquidity to FDV ratio safety check
+        if fdv > 0 and (liquidity / fdv) < 0.01:
+            print(f"[SECURITY FAIL] {mint[:8]}... Thin Liquidity Ratio ({liquidity/fdv:.2%})", flush=True)
             return False
+
+        print(f"[SECURITY PASS] {mint[:8]}... | Liquidity: ${liquidity:,.0f}", flush=True)
+        return True
+
+    except Exception as e:
+        print(f"[SECURITY EXCEPTION] {mint[:8]}... : {e}", flush=True)
+        return False
+
 
         # --- 2. SOLANA ON-CHAIN TOP 10 HOLDER CHECK ---
         rpc_url = "https://api.mainnet-beta.solana.com" # Use standard RPC or QuickNode/Helius
