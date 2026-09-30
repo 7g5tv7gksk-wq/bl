@@ -621,8 +621,8 @@ def check_gmgn(mint):
             impersonate="chrome",
             timeout=5
         )
-        print(f"\n[DEBUG GMGN] Token: {mint} | Status Code: {r.status_code}")
-        print(f"[DEBUG GMGN Raw Response Snippet]: {r.text[:150]}")
+        print(f"\n[DEBUG GMGN] Token: {mint} | Status Code: {r.status_code}", flush=True)
+        print(f"[DEBUG GMGN Raw Snippet]: {r.text[:150]}", flush=True)
 
         if r.status_code == 200:
             tok = r.json().get("data", {}).get("token", {})
@@ -631,29 +631,30 @@ def check_gmgn(mint):
             top_10 = float(tok.get("top_10_holder_rate", 0) or 0)
             liquidity = float(tok.get("liquidity", 0) or 0)
 
-            print(f"[DEBUG GMGN Parsed]: bundler_pct={bundler_pct}, rug_ratio={rug_ratio}, top_10={top_10}, liquidity={liquidity}")
+            print(f"[DEBUG GMGN Parsed]: bundler_pct={bundler_pct}, rug_ratio={rug_ratio}, top_10={top_10}, liquidity={liquidity}", flush=True)
 
             if bundler_pct > 10:
-                print(f"[DEBUG GMGN Fail]: bundler_pct {bundler_pct} > 10")
+                print(f"[DEBUG GMGN Fail]: bundler_pct {bundler_pct} > 10", flush=True)
                 return False
             if rug_ratio > 0.30:
-                print(f"[DEBUG GMGN Fail]: rug_ratio {rug_ratio} > 0.30")
+                print(f"[DEBUG GMGN Fail]: rug_ratio {rug_ratio} > 0.30", flush=True)
                 return False
             if top_10 > 0.50:
-                print(f"[DEBUG GMGN Fail]: top_10_holder_rate {top_10} > 0.50")
+                print(f"[DEBUG GMGN Fail]: top_10_holder_rate {top_10} > 0.50", flush=True)
                 return False
             if liquidity < 3000:
-                print(f"[DEBUG GMGN Fail]: liquidity {liquidity} < 3000")
+                print(f"[DEBUG GMGN Fail]: liquidity {liquidity} < 3000", flush=True)
                 return False
 
-            print("[DEBUG GMGN Pass]: All conditions met!")
+            print("[DEBUG GMGN Pass]: All conditions met!", flush=True)
             return True
 
-        print(f"[DEBUG GMGN Fail]: Non-200 Status Code ({r.status_code})")
+        print(f"[DEBUG GMGN Fail]: Non-200 Status Code ({r.status_code})", flush=True)
         return False
     except Exception as e:
-        print(f"[DEBUG GMGN Exception]: {e}")
+        print(f"[DEBUG GMGN Exception]: {e}", flush=True)
         return False
+
 
 
 
