@@ -615,17 +615,24 @@ def check_gmgn(mint):
     try:
         r = requests.get(
             f"https://gmgn.ai/defi/quotation/v1/tokens/sol/{mint}",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=5
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            timeout=5
         )
         if r.status_code == 200:
             tok = r.json().get("data", {}).get("token", {})
             if float(tok.get("bundler_pct", 0) or 0) > 10:
                 return False
-            if float(tok.get("rug_ratio",   0) or 0) > 0.30:
+            if float(tok.get("rug_ratio", 0) or 0) > 0.30:
                 return False
+            if float(tok.get("top_10_holder_rate", 0) or 0) > 0.50:
+                return False
+            if float(tok.get("liquidity", 0) or 0) < 1000:
+                return False
+            return True
+        return False
     except Exception:
-        pass
-    return True
+        return False
+
 
 def check_rugcheck(mint):
     try:
@@ -637,14 +644,20 @@ def check_rugcheck(mint):
             data = r.json()
             if data.get("riskLevel") in ("Danger", "High"):
                 return False
-            bad = {"Single holder ownership", "High holder concentration",
-                   "Mint Authority Enabled", "Freeze Authority Enabled"}
+            bad = {
+                "Single holder ownership", 
+                "High holder concentration",
+                "Mint Authority Enabled", 
+                "Freeze Authority Enabled"
+            }
             for risk in data.get("risks", []):
                 if risk.get("name") in bad:
                     return False
+            return True
+        return False
     except Exception:
-        pass
-    return True
+        return False
+
 
 
 # =====================================================================
