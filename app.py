@@ -616,58 +616,94 @@ def compute_momentum_signal(token):
 import time
 import requests
 
-def check_gmgn(mint):
+def check_gmgn_batch(mints):
     """
-    Evaluates token liquidity and basic safety using DexScreener API.
-    Includes a 0.25s delay to keep total requests under DexScreener rate limits.
+    Evaluates liquidity and safety for up to 30 token mints in a single request.
+    Returns a dict mapping mint -> True (Passed) / False (Failed).
     """
-    # Pace requests (~4 per second) to stay under DexScreener's 300 req/min limit
-    time.sleep(0.5)
+    if not mints:
+        return {}
+
+    # Initialize results map (default to False)
+    results = {mint: False for mint in mints}
+    
+    # DexScreener allows max 30 tokens per request
+    chunk_size = 30
+    mint_chunks = [mints[i:i + chunk_size] for i in range(0, len(mints), chunk_size)]
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
 
-    try:
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-        res = requests.get(url, headers=headers, timeout=5)
+    for chunk in mint_chunks:
+        # Join mints with commas for DexScreener batch endpoint
+        joined_mints = ",".join(chunk)
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{joined_mints}"
 
-        if res.status_code == 429:
-            print(f"[SECURITY FAIL] DexScreener 429 Rate Limit hit for {mint}", flush=True)
-            return False
+        max_retries = 3
+        res = None
 
-        if res.status_code != 200:
-            print(f"[SECURITY FAIL] DexScreener Non-200 Status ({res.status_code}) for {mint}", flush=True)
-            return False
+        for attempt in range(max_retries):
+            try:
+                # 0.5s pause per batch chunk (90%+ reduction in total HTTP calls)
+                time.sleep(0.5) 
+                res = requests.get(url, headers=headers, timeout=5)
+
+                if res.status_code == 200:
+                    break
+                elif res.status_code == 429:
+                    wait_time = (attempt + 1) * 3
+                    print(f"[BATCH WAIT] DexScreener 429 rate limit. Retrying in {wait_time}s...", flush=True)
+                    time.sleep(wait_time)
+                else:
+                    print(f"[BATCH FAIL] Non-200 Status ({res.status_code}) from DexScreener", flush=True)
+                    break
+            except Exception as e:
+                print(f"[BATCH ERROR] Request failed: {e}", flush=True)
+                break
+
+        if not res or res.status_code != 200:
+            continue
 
         data = res.json()
         pairs = data.get("pairs") or []
 
-        if not pairs:
-            print(f"[SECURITY FAIL] No active pair found on DexScreener for {mint}", flush=True)
-            return False
+        # Map returned pairs back to their corresponding base token mints
+        # DexScreener returns pairs array; group them by base token address
+        pairs_by_mint = {}
+        for pair in pairs:
+            base_addr = pair.get("baseToken", {}).get("address")
+            if base_addr and base_addr in chunk:
+                if base_addr not in pairs_by_mint:
+                    pairs_by_mint[base_addr] = []
+                pairs_by_mint[base_addr].append(pair)
 
-        # Evaluate primary pair
-        main_pair = pairs[0]
-        liquidity = float(main_pair.get("liquidity", {}).get("usd", 0) or 0)
-        fdv = float(main_pair.get("fdv", 0) or 0)
+        # Evaluate each token in the chunk
+        for mint in chunk:
+            token_pairs = pairs_by_mint.get(mint, [])
+            if not token_pairs:
+                print(f"[SECURITY FAIL] {mint[:8]}... No active pair found on DexScreener", flush=True)
+                continue
 
-        # Minimum Liquidity Check ($3,000)
-        if liquidity < 3000:
-            print(f"[SECURITY FAIL] {mint[:8]}... Low Liquidity (${liquidity:,.0f} < $3,000)", flush=True)
-            return False
+            main_pair = token_pairs[0]
+            liquidity = float(main_pair.get("liquidity", {}).get("usd", 0) or 0)
+            fdv = float(main_pair.get("fdv", 0) or 0)
 
-        # Basic Liquidity to FDV ratio safety check
-        if fdv > 0 and (liquidity / fdv) < 0.01:
-            print(f"[SECURITY FAIL] {mint[:8]}... Thin Liquidity Ratio ({liquidity/fdv:.2%})", flush=True)
-            return False
+            # Minimum Liquidity Check ($3,000)
+            if liquidity < 3000:
+                print(f"[SECURITY FAIL] {mint[:8]}... Low Liquidity (${liquidity:,.0f} < $3,000)", flush=True)
+                continue
 
-        print(f"[SECURITY PASS] {mint[:8]}... | Liquidity: ${liquidity:,.0f}", flush=True)
-        return True
+            # Basic Liquidity to FDV ratio safety check
+            if fdv > 0 and (liquidity / fdv) < 0.01:
+                print(f"[SECURITY FAIL] {mint[:8]}... Thin Liquidity Ratio ({liquidity/fdv:.2%})", flush=True)
+                continue
 
-    except Exception as e:
-        print(f"[SECURITY EXCEPTION] {mint[:8]}... : {e}", flush=True)
-        return False
+            print(f"[SECURITY PASS] {mint[:8]}... | Liquidity: ${liquidity:,.0f}", flush=True)
+            results[mint] = True
+
+    return results
+
 
 
         # --- 2. SOLANA ON-CHAIN TOP 10 HOLDER CHECK ---
