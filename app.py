@@ -7,6 +7,8 @@ import queue
 import threading
 import requests
 from flask import Flask
+from curl_cffi import requests as c_requests
+
 
 # Logging is routed through a queue instead of writing to stdout directly
 # from application threads. Python's logging module serializes every call
@@ -613,9 +615,10 @@ def compute_momentum_signal(token):
 # =====================================================================
 def check_gmgn(mint):
     try:
-        r = requests.get(
+        r = c_requests.get(
             f"https://gmgn.ai/defi/quotation/v1/tokens/sol/{mint}",
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"},
+            impersonate="chrome",
             timeout=5
         )
         if r.status_code == 200:
@@ -632,6 +635,7 @@ def check_gmgn(mint):
         return False
     except Exception:
         return False
+
 
 
 def check_rugcheck(mint):
