@@ -615,7 +615,7 @@ def compute_momentum_signal(token):
 # =====================================================================
 import requests
 
-def check_security_clean(mint):
+def check_gmgn(mint):
     headers = {"User-Agent": "Mozilla/5.0"}
     
     try:
