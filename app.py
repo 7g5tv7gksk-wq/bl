@@ -617,24 +617,44 @@ def check_gmgn(mint):
     try:
         r = c_requests.get(
             f"https://gmgn.ai/defi/quotation/v1/tokens/sol/{mint}",
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
             impersonate="chrome",
             timeout=5
         )
+        print(f"\n[DEBUG GMGN] Token: {mint} | Status Code: {r.status_code}")
+        print(f"[DEBUG GMGN Raw Response Snippet]: {r.text[:150]}")
+
         if r.status_code == 200:
             tok = r.json().get("data", {}).get("token", {})
-            if float(tok.get("bundler_pct", 0) or 0) > 10:
+            bundler_pct = float(tok.get("bundler_pct", 0) or 0)
+            rug_ratio = float(tok.get("rug_ratio", 0) or 0)
+            top_10 = float(tok.get("top_10_holder_rate", 0) or 0)
+            liquidity = float(tok.get("liquidity", 0) or 0)
+
+            print(f"[DEBUG GMGN Parsed]: bundler_pct={bundler_pct}, rug_ratio={rug_ratio}, top_10={top_10}, liquidity={liquidity}")
+
+            if bundler_pct > 10:
+                print(f"[DEBUG GMGN Fail]: bundler_pct {bundler_pct} > 10")
                 return False
-            if float(tok.get("rug_ratio", 0) or 0) > 0.30:
+            if rug_ratio > 0.30:
+                print(f"[DEBUG GMGN Fail]: rug_ratio {rug_ratio} > 0.30")
                 return False
-            if float(tok.get("top_10_holder_rate", 0) or 0) > 0.50:
+            if top_10 > 0.50:
+                print(f"[DEBUG GMGN Fail]: top_10_holder_rate {top_10} > 0.50")
                 return False
-            if float(tok.get("liquidity", 0) or 0) < 3000:
+            if liquidity < 3000:
+                print(f"[DEBUG GMGN Fail]: liquidity {liquidity} < 3000")
                 return False
+
+            print("[DEBUG GMGN Pass]: All conditions met!")
             return True
+
+        print(f"[DEBUG GMGN Fail]: Non-200 Status Code ({r.status_code})")
         return False
-    except Exception:
+    except Exception as e:
+        print(f"[DEBUG GMGN Exception]: {e}")
         return False
+
 
 
 
