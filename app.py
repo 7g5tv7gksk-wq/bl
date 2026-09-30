@@ -626,7 +626,7 @@ def check_gmgn(mint):
                 return False
             if float(tok.get("top_10_holder_rate", 0) or 0) > 0.50:
                 return False
-            if float(tok.get("liquidity", 0) or 0) < 1000:
+            if float(tok.get("liquidity", 0) or 0) < 3000:
                 return False
             return True
         return False
