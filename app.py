@@ -622,7 +622,7 @@ def check_gmgn(mint):
     Includes a 0.25s delay to keep total requests under DexScreener rate limits.
     """
     # Pace requests (~4 per second) to stay under DexScreener's 300 req/min limit
-    time.sleep(0.25)
+    time.sleep(0.5)
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -989,7 +989,7 @@ def run_bot():
                     security_rejected[mint] = time.time()
                     continue
                 if not check_gmgn(mint):
-                    logging.info(f"🛡️ [REJECTED] ${symbol} — GMGN fail")
+                    logging.info(f"🛡️ [REJECTED] ${symbol} — Dexscreener fail")
                     tally["security_rejected"] += 1
                     security_rejected[mint] = time.time()
                     continue
