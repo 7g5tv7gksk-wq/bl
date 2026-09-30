@@ -1011,7 +1011,7 @@ def run_bot():
 
                 # ── Entry ─────────────────────────────────────────────
                 reason_parts = [
-                    f"${cand['symbol']}", f"MC=${cand['mc']:,.0f}",
+                    f"${cand['symbol']} ({mint})", f"MC=${cand['mc']:,.0f}",
                     f"SOL={sol_regime}", f"Signal={cand['signal']:+.3f} [{cand['signal_src']}]",
                     f"size={size:.3f} SOL",
                 ]
@@ -1034,7 +1034,8 @@ def run_bot():
                     }
                     logging.info(
                         f"💰 [PAPER] BUY {size:.3f} SOL → "
-                        f"${cand['symbol']} @ ${entry_price:.8f} "
+                        f"${cand['symbol']} ({mint}) @ ${entry_price:.8f} "
+
                         f"(live ${live_price:.8f} + {FEE_SLIPPAGE_PCT*100:.1f}% cost)"
                     )
                 # ── Live execution stub ────────────────────────────────
