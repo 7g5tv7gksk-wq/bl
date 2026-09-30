@@ -4,3 +4,4 @@ pandas
 numpy
 hmmlearn
 requests
+curl-cffi
