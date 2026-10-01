@@ -1024,11 +1024,11 @@ def run_bot():
                     security_rejected[mint] = time.time()
                     continue
         
-        if not security_results.get(mint, False):
-            logging.info(f"🛡️ [REJECTED] ${symbol} - Failed DexScreener check")
-            tally["security_rejected"] += 1
-            security_rejected[mint] = time.time()
-            continue
+                if not security_results.get(mint, False):
+                    logging.info(f"🛡️ [REJECTED] ${symbol} - Failed DexScreener check")
+                    tally["security_rejected"] += 1
+                    security_rejected[mint] = time.time()
+                    continue
         
                 if mint not in coin_trackers:
                     coin_trackers[mint] = CoinMarkovTracker(mint, symbol, graduated_pool_hint)
