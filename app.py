@@ -1062,7 +1062,7 @@ def run_bot():
                     "stickiness": tracker.stickiness if tracker.ready else None,
                 })
             
-        except Exception as e: 
+       except Exception as e: 
                 logging.error(f"[ERROR] main loop iteration failed: {e}")
                  time.sleep(LOOP_INTERVAL)
             if mints:
