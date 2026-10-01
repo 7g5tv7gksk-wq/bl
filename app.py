@@ -984,10 +984,11 @@ def run_bot():
                 f"Active={len(active_positions)}"
             )
 
-            token_map = fetch_jupiter_candidates()
-            mints     = list(token_map.keys())
-            candidates = []
-            tally = {
+        token_map = fetch_jupiter_candidates()
+        mints = list(token_map.keys())
+        security_results = check_gmgn_batch(mints)
+        candidates = []
+
                 "total": len(mints), "in_position_or_blacklist": 0,
                 "security_blacklist_skip": 0, "no_token_data": 0,
                 "failed_filters": 0, "security_rejected": 0,
@@ -1024,11 +1025,12 @@ def run_bot():
                     tally["security_rejected"] += 1
                     security_rejected[mint] = time.time()
                     continue
-                if not check_gmgn(mint):
-                    logging.info(f"🛡️ [REJECTED] ${symbol} — Dexscreener fail")
-                    tally["security_rejected"] += 1
-                    security_rejected[mint] = time.time()
-                    continue
+        if not security_results.get(mint, False):
+            logging.info(f"🛡️ [REJECTED] ${symbol} - Failed DexScreener check")
+            tally["security_rejected"] += 1
+            security_rejected[mint] = time.time()
+            continue
+
                 if mint not in coin_trackers:
                     coin_trackers[mint] = CoinMarkovTracker(mint, symbol, graduated_pool_hint)
                 tracker = coin_trackers[mint]
