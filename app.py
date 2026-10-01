@@ -707,33 +707,31 @@ def check_gmgn_batch(mints):
 
 
         # --- 2. SOLANA ON-CHAIN TOP 10 HOLDER CHECK ---
-        rpc_url = "https://api.mainnet-beta.solana.com" # Use standard RPC or QuickNode/Helius
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTokenLargestAccounts",
-            "params": [mint]
-        }
-        
+    return results
+
+def check_top_holders(mint):
+    rpc_url = "https://api.mainnet-beta.solana.com"
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTokenLargestAccounts",
+        "params": [mint]
+    }
+    
+    try:
         rpc_res = requests.post(rpc_url, json=payload, timeout=5).json()
         accounts = rpc_res.get("result", {}).get("value", [])
 
         if accounts:
-            # Total supply for standard SPL token with 6 decimals is typically 1,000,000,000
-            # Sum top 10 balances
             top_10_sum = sum(float(acc.get("uiAmount", 0) or 0) for acc in accounts[:10])
-            
-            # Fetch total supply via RPC or estimate against SPL standard 1B
-            # If top 10 own over 50% of supply:
-            # (adjust threshold if evaluating pre-bonding curve tokens)
-            print(f"[DEBUG RPC] Top 10 Accounts Total: {top_10_sum:,.0f}", flush=True)
+            print(f"[DEBUG RPC] Top 10 Accounts Total: {top_10_sum}", flush=True)
 
-        print(f"[SECURITY PASS] {mint} cleared DexScreener & RPC checks!", flush=True)
+        print(f"[SECURITY PASS] {mint} cleared holder check", flush=True)
         return True
-
     except Exception as e:
         print(f"[SECURITY EXCEPTION]: {e}", flush=True)
         return False
+
 
 
 
