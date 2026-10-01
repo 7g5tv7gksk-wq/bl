@@ -539,7 +539,7 @@ def fetch_jupiter_candidates():
                     items = data.get("data") or data.get("tokens") or []
                 else:
                     items = []
-                for item in items[:10]:
+                for item in items[:5]:
                     addr = item.get("address") or item.get("mint") or item.get("id")
                     if addr and addr not in token_map:
                         token_map[addr] = item
@@ -628,7 +628,7 @@ def check_gmgn_batch(mints):
     results = {mint: False for mint in mints}
     
     # DexScreener allows max 30 tokens per request
-    chunk_size = 20
+    chunk_size = 10
     mint_chunks = [mints[i:i + chunk_size] for i in range(0, len(mints), chunk_size)]
 
     headers = {
