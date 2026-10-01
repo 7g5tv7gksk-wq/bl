@@ -982,10 +982,10 @@ def run_bot():
                 f"Active={len(active_positions)}"
             )
 
-        token_map = fetch_jupiter_candidates()
-        mints = list(token_map.keys())
-        security_results = check_gmgn_batch(mints)
-        candidates = []
+            token_map = fetch_jupiter_candidates()
+            mints = list(token_map.keys())
+            security_results = check_gmgn_batch(mints)
+            candidates = []
 
                 "total": len(mints), "in_position_or_blacklist": 0,
                 "security_blacklist_skip": 0, "no_token_data": 0,
