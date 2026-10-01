@@ -986,7 +986,7 @@ def run_bot():
             mints = list(token_map.keys())
             security_results = check_gmgn_batch(mints)
             candidates = []
-             stats{
+            stats={
                 "total": len(mints), "in_position_or_blacklist": 0,
                 "security_blacklist_skip": 0, "no_token_data": 0,
                 "failed_filters": 0, "security_rejected": 0,
