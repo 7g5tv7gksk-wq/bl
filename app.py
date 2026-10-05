@@ -9,12 +9,6 @@ import requests
 from flask import Flask
 
 # ── Non-blocking logging queue ────────────────────────────────────────
-# Python's logging module holds one internal lock while writing to stdout.
-# If that write ever stalls (pipe back-pressure under load), every thread
-# waiting to log blocks too — silently freezing the bot while gunicorn's
-# HTTP handling keeps returning 200. Routing through a queue makes every
-# logging call a fast non-blocking queue.put(); a single dedicated thread
-# does the actual write so only that thread can stall.
 _log_queue = queue.Queue(-1)
 _stream_handler = logging.StreamHandler()
 _stream_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
@@ -51,7 +45,7 @@ TAKE_PROFIT_PCT          = 0.35
 STOP_LOSS_PCT            = 0.12
 BLACKLIST_COOLDOWN       = 7200
 SECURITY_REJECT_COOLDOWN = 14400
-MAX_POSITIONS            = 5
+MAX_POSITIONS            = 1
 LOOP_INTERVAL            = 30
 OHLCV_TTL                = 300
 OHLCV_RETRY_COOLDOWN     = 45
@@ -60,6 +54,14 @@ POOL_RESOLVE_MAX_ATTEMPTS= 5
 
 MAX_ENTRY_DRIFT_PCT      = 0.03
 FEE_SLIPPAGE_PCT         = 0.01
+
+# ── Trailing stop ─────────────────────────────────────────────────────
+TRAIL_ACTIVATE_PCT       = 0.20   # Start trailing once gross hits +20%
+TRAIL_DISTANCE_PCT       = 0.10   # Trail 10% below peak (peak +20% → stop at +10%)
+
+# ── Stagnant exit ─────────────────────────────────────────────────────
+STAGNANT_THRESHOLD_PCT   = 0.005  # 0.5% move resets the clock
+STAGNANT_EXIT_SECONDS    = 2700   # 45 minutes of no movement → close
 
 MAX_DAILY_LOSS_SOL       = 0.50
 MAX_CONSECUTIVE_LOSSES   = 3
@@ -94,6 +96,15 @@ def gecko_available():
 
 def gecko_mark_limited():
     _gecko_backoff["until"] = time.time() + GECKO_BACKOFF_SECONDS
+
+_dex_backoff    = {"until": 0}
+DEX_BACKOFF_SECONDS = 60
+
+def dex_available():
+    return time.time() >= _dex_backoff["until"]
+
+def dex_mark_limited():
+    _dex_backoff["until"] = time.time() + DEX_BACKOFF_SECONDS
 
 # =====================================================================
 # STATE
@@ -304,20 +315,12 @@ def fetch_ohlcv(pool_address, agg_min=5, limit=200):
         return []
 
 def resolve_pool_address(mint, graduated_pool_hint=None):
-    """
-    Returns (pool_address_or_None, was_rate_limited).
-    was_rate_limited=True means the failure was transient — don't count
-    it toward the give-up counter on the tracker.
-    """
     if graduated_pool_hint:
         return graduated_pool_hint, False
-
     if mint in _pool_cache:
         return _pool_cache[mint], False
-
     if not gecko_available():
         return None, True
-
     url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}/pools"
     try:
         r = requests.get(url, headers={"Accept": "application/json"}, timeout=8)
@@ -356,7 +359,6 @@ def _atr_pct(candles, period=14):
     return sum(tail) / len(tail) if tail else 3.0
 
 def _label_states(candles, stride, bull_mult, bear_mult):
-    """FIX 1 — Stride sampling: non-overlapping windows, ATR-adaptive thresholds."""
     atr         = _atr_pct(candles)
     bull_thresh =  atr * bull_mult
     bear_thresh = -atr * bear_mult
@@ -384,7 +386,6 @@ def _build_matrix(states):
     return matrix, stickiness
 
 def _verify_labels(states, candles, stride):
-    """FIX 2 — Label verification: spot-check first, middle, last windows."""
     errors = 0
     for idx in [0, len(states) // 2, len(states) - 1]:
         start = idx * stride
@@ -402,7 +403,6 @@ def _verify_labels(states, candles, stride):
     return errors == 0
 
 def _markov_signal(matrix, current_state):
-    """P(BULL|current) − P(BEAR|current). Range −1 to +1."""
     return round(matrix[current_state][BULL] - matrix[current_state][BEAR], 4)
 
 # =====================================================================
@@ -441,7 +441,6 @@ class CoinMarkovTracker:
     def refresh(self):
         if self.pool_abandoned:
             return
-
         if not self.pool_address:
             if time.time() - self.pool_last_try < OHLCV_RETRY_COOLDOWN:
                 return
@@ -462,31 +461,25 @@ class CoinMarkovTracker:
                             f"momentum-only from here"
                         )
                 return
-
         ttl = OHLCV_TTL if self.candles else OHLCV_RETRY_COOLDOWN
         if time.time() - self.last_fetch < ttl:
             return
-
         candles = fetch_ohlcv(self.pool_address)
         self.last_fetch = time.time()
-
         if not candles:
             return
-
         self.candles = candles
         states, bull_t, bear_t = _label_states(
             candles, STRIDE_BARS, ATR_BULL_MULT, ATR_BEAR_MULT
         )
         if len(states) < 3:
             return
-
         self.verified      = _verify_labels(states, candles, STRIDE_BARS)
         self.states        = states
         self.windows       = len(states)
         self.matrix, self.stickiness = _build_matrix(states)
         self.current_state = states[-1]
         self.signal        = _markov_signal(self.matrix, self.current_state)
-
         logging.info(
             f"📈 [MARKOV] ${self.symbol} | "
             f"Windows={self.windows} | State={STATE_NAME[self.current_state]} | "
@@ -497,10 +490,9 @@ class CoinMarkovTracker:
         )
 
 # =====================================================================
-# CANDIDATE DISCOVERY — JUPITER TOKEN API V2 ONLY
+# CANDIDATE DISCOVERY
 # =====================================================================
 def fetch_jupiter_candidates():
-    """Returns {mint: token_object} for up to 40 candidates (20 per source)."""
     token_map     = {}
     source_report = []
     sources = [
@@ -572,7 +564,7 @@ def validate_token(token):
     return True
 
 # =====================================================================
-# LAYER 2 — MOMENTUM SIGNAL (cold-start fallback)
+# LAYER 2 — MOMENTUM SIGNAL
 # =====================================================================
 def compute_momentum_signal(token):
     stats5m = token.get("stats5m") or {}
@@ -600,59 +592,61 @@ def compute_momentum_signal(token):
 def check_gmgn_batch(mints):
     """
     DexScreener batch liquidity/safety check.
-    Called AFTER validate_token() so we only query tokens already past
-    the basic filters — no wasted API calls or blocking sleeps.
-    Single attempt per chunk, no retry sleeps. On API error tokens
-    default to True (pass) so an outage doesn't stop all trading.
+    Uses shared 60s backoff: a 429 on any chunk skips all remaining
+    chunks that cycle and backs off before trying again.
     """
     if not mints:
         return {}
+    if not dex_available():
+        return {mint: True for mint in mints}
 
     results = {mint: True for mint in mints}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
     for i in range(0, len(mints), 10):
+        if not dex_available():
+            break
         chunk = mints[i:i + 10]
         url   = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(chunk)}"
         try:
             res = requests.get(url, headers=headers, timeout=5)
+            if res.status_code == 429:
+                dex_mark_limited()
+                logging.warning(
+                    f"⚠️ [SECURITY] DexScreener rate limited — "
+                    f"backing off {DEX_BACKOFF_SECONDS}s"
+                )
+                break
             if res.status_code != 200:
                 logging.warning(
                     f"⚠️ [SECURITY] DexScreener batch returned {res.status_code} — "
                     f"skipping chunk, tokens default to pass"
                 )
                 continue
-
             pairs_by_mint = {}
             for pair in (res.json().get("pairs") or []):
                 base_addr = pair.get("baseToken", {}).get("address")
                 if base_addr and base_addr in chunk:
                     pairs_by_mint.setdefault(base_addr, []).append(pair)
-
             for mint in chunk:
                 token_pairs = pairs_by_mint.get(mint, [])
                 if not token_pairs:
                     results[mint] = False
                     logging.info(f"🛡️ [SECURITY] {mint[:8]}… — no active pair on DexScreener")
                     continue
-
                 main_pair = token_pairs[0]
                 liquidity = float(main_pair.get("liquidity", {}).get("usd", 0) or 0)
                 fdv       = float(main_pair.get("fdv", 0) or 0)
-
                 if liquidity < 3000:
                     results[mint] = False
                     logging.info(f"🛡️ [SECURITY] {mint[:8]}… — low liquidity ${liquidity:,.0f}")
                     continue
-
                 if fdv > 0 and (liquidity / fdv) < 0.01:
                     results[mint] = False
                     logging.info(
-                        f"🛡️ [SECURITY] {mint[:8]}… — "
-                        f"thin liquidity ratio {liquidity/fdv:.2%}"
+                        f"🛡️ [SECURITY] {mint[:8]}… — thin liquidity ratio {liquidity/fdv:.2%}"
                     )
                     continue
-
         except Exception as e:
             logging.warning(f"⚠️ [SECURITY] DexScreener batch error: {e}")
 
@@ -660,11 +654,6 @@ def check_gmgn_batch(mints):
 
 
 def check_rugcheck(mint):
-    """
-    Returns True on any exception or non-200 response so a RugCheck
-    outage doesn't halt all trading. The DexScreener batch check and
-    validate_token() filters still provide a safety net.
-    """
     try:
         r = requests.get(
             f"https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary",
@@ -691,7 +680,6 @@ def check_rugcheck(mint):
 # REAL-TIME PRICE
 # =====================================================================
 def get_price(mint):
-    # 1. Jupiter Price API v2 (fastest)
     if jup_available():
         try:
             r = requests.get(
@@ -706,8 +694,6 @@ def get_price(mint):
                 jup_mark_limited()
         except Exception:
             pass
-
-    # 2. Jupiter Token Search API (fallback)
     if jup_available():
         try:
             r = requests.get(
@@ -730,8 +716,6 @@ def get_price(mint):
                 jup_mark_limited()
         except Exception:
             pass
-
-    # 3. DexScreener emergency fallback
     try:
         r = requests.get(
             f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
@@ -745,7 +729,6 @@ def get_price(mint):
                     return float(p)
     except Exception:
         pass
-
     return None
 
 # =====================================================================
@@ -774,11 +757,27 @@ def run_monitor():
                     gross  = (price - entry) / entry
                     net    = gross - 2 * FEE_SLIPPAGE_PCT
                     size   = info.get("trade_size", SOL_TRADE_SIZE)
+                    now    = time.time()
+
+                    # ── Trailing stop bookkeeping ─────────────────────
+                    peak_gross = info.get("peak_gross", gross)
+                    if gross > peak_gross:
+                        peak_gross = gross
+                        active_positions[mint]["peak_gross"] = peak_gross
+
+                    # ── Stagnant exit bookkeeping ─────────────────────
+                    last_gross     = info.get("last_gross", gross)
+                    last_move_time = info.get("last_move_time", now)
+                    if abs(gross - last_gross) > STAGNANT_THRESHOLD_PCT:
+                        active_positions[mint]["last_gross"]     = gross
+                        active_positions[mint]["last_move_time"] = now
+                        last_move_time = now
 
                     pnl_lines.append(
                         f"${symbol} {gross*100:+.1f}% gross / {net*100:+.1f}% net"
                     )
 
+                    # ── Take profit ───────────────────────────────────
                     if gross >= TAKE_PROFIT_PCT:
                         net_sol = size * net
                         trade_stats["total_closed"] += 1
@@ -800,10 +799,11 @@ def run_monitor():
                                 f"Net={trade_stats['net_sol_pnl']:+.4f} SOL",
                                 mint=mint
                             )
-                        except Exception as post_err:
-                            logging.warning(f"⚠️ [MONITOR] TP post error: {post_err}")
+                        except Exception:
+                            pass
                         to_close.append(mint)
 
+                    # ── Stop loss ─────────────────────────────────────
                     elif gross <= -STOP_LOSS_PCT:
                         net_sol = size * net
                         trade_stats["total_closed"] += 1
@@ -825,9 +825,71 @@ def run_monitor():
                                 f"Blacklisting 2h.",
                                 mint=mint
                             )
-                        except Exception as post_err:
-                            logging.warning(f"⚠️ [MONITOR] SL post error: {post_err}")
+                        except Exception:
+                            pass
                         stopped_out_tokens[mint] = time.time()
+                        to_close.append(mint)
+
+                    # ── Trailing stop ─────────────────────────────────
+                    elif (peak_gross >= TRAIL_ACTIVATE_PCT
+                          and gross <= peak_gross - TRAIL_DISTANCE_PCT
+                          and mint not in to_close):
+                        net_sol = size * net
+                        trade_stats["total_closed"] += 1
+                        trade_stats["wins"]         += 1
+                        trade_stats["net_sol_pnl"]  += net_sol
+                        wr = trade_stats["wins"] / trade_stats["total_closed"] * 100
+                        logging.info(
+                            f"📍 [TRAIL] ${symbol} gross {gross*100:+.1f}% | "
+                            f"peak was {peak_gross*100:+.1f}% | "
+                            f"net {net*100:.1f}% | +{net_sol:.4f} SOL | "
+                            f"WR={wr:.1f}% | Net={trade_stats['net_sol_pnl']:+.4f} SOL"
+                        )
+                        risk_on_win()
+                        log_trade(symbol, mint, "TRAIL", entry, price,
+                                  info.get("signal_src", "?"), info.get("signal", 0))
+                        try:
+                            familiars_post(
+                                "trade",
+                                f"Trailing stop {gross*100:+.1f}% (peak {peak_gross*100:+.1f}%) "
+                                f"on ${symbol}. Net={trade_stats['net_sol_pnl']:+.4f} SOL",
+                                mint=mint
+                            )
+                        except Exception:
+                            pass
+                        to_close.append(mint)
+
+                    # ── Stagnant exit ─────────────────────────────────
+                    elif (now - last_move_time > STAGNANT_EXIT_SECONDS
+                          and mint not in to_close):
+                        net_sol = size * net
+                        trade_stats["total_closed"] += 1
+                        if net >= 0:
+                            trade_stats["wins"] += 1
+                            risk_on_win()
+                        else:
+                            trade_stats["losses"] += 1
+                            risk_on_loss(abs(net_sol))
+                        trade_stats["net_sol_pnl"] += net_sol
+                        wr = trade_stats["wins"] / trade_stats["total_closed"] * 100
+                        stagnant_mins = (now - last_move_time) / 60
+                        logging.info(
+                            f"⏸️ [STAGNANT] ${symbol} no movement for "
+                            f"{stagnant_mins:.0f}m | gross {gross*100:+.1f}% | "
+                            f"net {net*100:.1f}% | {net_sol:+.4f} SOL | "
+                            f"WR={wr:.1f}% | Net={trade_stats['net_sol_pnl']:+.4f} SOL"
+                        )
+                        log_trade(symbol, mint, "STAGNANT", entry, price,
+                                  info.get("signal_src", "?"), info.get("signal", 0))
+                        try:
+                            familiars_post(
+                                "trade",
+                                f"Stagnant exit ({stagnant_mins:.0f}m no movement) "
+                                f"on ${symbol}. Net={trade_stats['net_sol_pnl']:+.4f} SOL",
+                                mint=mint
+                            )
+                        except Exception:
+                            pass
                         to_close.append(mint)
 
                 for mint in to_close:
@@ -918,7 +980,6 @@ def run_bot():
                     continue
                 pre_filtered.append(mint)
 
-            # Batch security check on pre-filtered tokens only
             security_results = check_gmgn_batch(pre_filtered) if pre_filtered else {}
 
             # Pass 2: security + signal evaluation
@@ -1076,11 +1137,14 @@ def run_bot():
 
                 if PAPER_TRADING:
                     active_positions[mint] = {
-                        "symbol":      cand["symbol"],
-                        "entry_price": entry_price,
-                        "trade_size":  size,
-                        "signal_src":  cand["signal_src"],
-                        "signal":      cand["signal"],
+                        "symbol":         cand["symbol"],
+                        "entry_price":    entry_price,
+                        "trade_size":     size,
+                        "signal_src":     cand["signal_src"],
+                        "signal":         cand["signal"],
+                        "peak_gross":     0.0,
+                        "last_gross":     0.0,
+                        "last_move_time": time.time(),
                     }
                     logging.info(
                         f"💰 [PAPER] BUY {size:.3f} SOL → "
