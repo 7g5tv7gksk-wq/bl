@@ -56,17 +56,25 @@ MAX_ENTRY_DRIFT_PCT      = 0.03
 FEE_SLIPPAGE_PCT         = 0.01
 
 # ── Trailing stop ─────────────────────────────────────────────────────
-TRAIL_ACTIVATE_PCT       = 0.20   # Start trailing once gross hits +20%
-TRAIL_DISTANCE_PCT       = 0.10   # Trail 10% below peak (peak +20% → stop at +10%)
+TRAIL_ACTIVATE_PCT       = 0.20
+TRAIL_DISTANCE_PCT       = 0.10
 
 # ── Stagnant exit ─────────────────────────────────────────────────────
-STAGNANT_THRESHOLD_PCT   = 0.005  # 0.5% move resets the clock
-STAGNANT_EXIT_SECONDS    = 2700   # 45 minutes of no movement → close
+STAGNANT_THRESHOLD_PCT   = 0.005
+STAGNANT_EXIT_SECONDS    = 2700
 
 MAX_DAILY_LOSS_SOL       = 0.50
 MAX_CONSECUTIVE_LOSSES   = 3
 
 TRADE_LOG_PATH           = "/tmp/trades.csv"
+
+# ── PnL sanity limits ─────────────────────────────────────────────────
+# DexScreener's price fallback can return the wrong token's price (e.g.
+# the stablecoin side of a pool at ~$1.00 instead of the memecoin at
+# $0.0001), producing a fake 9999x gross. These caps prevent a single
+# bad price read from corrupting the cumulative net_sol_pnl.
+MIN_VALID_PRICE          = 1e-9
+MAX_GROSS_REALISTIC      = 5.0
 
 FAMILIARS_KEY   = os.environ.get("FAMILIARS_API_KEY", "")
 FAMILIARS_URL   = "https://familiars.family"
@@ -79,7 +87,7 @@ def jup_headers():
         h["x-api-key"] = JUPITER_API_KEY
     return h
 
-_jup_backoff    = {"until": 0}
+_jup_backoff = {"until": 0}
 JUP_BACKOFF_SECONDS = 30
 
 def jup_available():
@@ -88,7 +96,7 @@ def jup_available():
 def jup_mark_limited():
     _jup_backoff["until"] = time.time() + JUP_BACKOFF_SECONDS
 
-_gecko_backoff  = {"until": 0}
+_gecko_backoff = {"until": 0}
 GECKO_BACKOFF_SECONDS = 60
 
 def gecko_available():
@@ -97,7 +105,7 @@ def gecko_available():
 def gecko_mark_limited():
     _gecko_backoff["until"] = time.time() + GECKO_BACKOFF_SECONDS
 
-_dex_backoff    = {"until": 0}
+_dex_backoff = {"until": 0}
 DEX_BACKOFF_SECONDS = 60
 
 def dex_available():
@@ -106,14 +114,26 @@ def dex_available():
 def dex_mark_limited():
     _dex_backoff["until"] = time.time() + DEX_BACKOFF_SECONDS
 
+# DexPaprika — free, no API key, generous rate limits.
+# Used for pool resolution so GeckoTerminal budget is OHLCV-only.
+DEXPAPRIKA_BASE     = "https://api.dexpaprika.com"
+_dexpaprika_backoff = {"until": 0}
+DEXPAPRIKA_BACKOFF_SECONDS = 15
+
+def dexpaprika_available():
+    return time.time() >= _dexpaprika_backoff["until"]
+
+def dexpaprika_mark_limited():
+    _dexpaprika_backoff["until"] = time.time() + DEXPAPRIKA_BACKOFF_SECONDS
+
 # =====================================================================
 # STATE
 # =====================================================================
-active_positions  = {}
-stopped_out_tokens= {}
-security_rejected = {}
-coin_trackers     = {}
-_pool_cache       = {}
+active_positions   = {}
+stopped_out_tokens = {}
+security_rejected  = {}
+coin_trackers      = {}
+_pool_cache        = {}
 trade_stats = {"total_closed": 0, "wins": 0, "losses": 0, "net_sol_pnl": 0.0}
 _sol_cache  = {"state": "SIDEWAYS", "last_check": 0}
 
@@ -143,11 +163,13 @@ def _ensure_trade_log():
     except Exception as e:
         logging.warning(f"⚠️ [LOG] Could not create trade log: {e}")
 
-def log_trade(symbol, mint, outcome, entry_price, exit_price, signal_src, signal):
+def log_trade(symbol, mint, outcome, entry_price, exit_price,
+              signal_src, signal, trade_size=None):
     try:
         gross   = (exit_price - entry_price) / entry_price
         net     = gross - 2 * FEE_SLIPPAGE_PCT
-        net_sol = SOL_TRADE_SIZE * net
+        size    = trade_size if trade_size is not None else SOL_TRADE_SIZE
+        net_sol = size * net
         with open(TRADE_LOG_PATH, "a", newline="") as f:
             csv.writer(f).writerow([
                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -315,10 +337,48 @@ def fetch_ohlcv(pool_address, agg_min=5, limit=200):
         return []
 
 def resolve_pool_address(mint, graduated_pool_hint=None):
+    """
+    Returns (pool_address_or_None, was_rate_limited).
+    Tries DexPaprika first (free, no key), falls back to GeckoTerminal.
+    This keeps all pool-resolution calls off GeckoTerminal so its quota
+    is spent exclusively on 5m OHLCV candles.
+    """
     if graduated_pool_hint:
         return graduated_pool_hint, False
+
     if mint in _pool_cache:
         return _pool_cache[mint], False
+
+    # ── Primary: DexPaprika ──────────────────────────────────────────
+    if dexpaprika_available():
+        url = (f"{DEXPAPRIKA_BASE}/networks/solana/tokens/{mint}/pools"
+               f"?order_by=volume_usd&sort=desc&limit=1")
+        try:
+            r = requests.get(url, headers={"Accept": "application/json"}, timeout=8)
+            if r.status_code == 200:
+                body = r.json()
+                if isinstance(body, list):
+                    items = body
+                elif isinstance(body, dict):
+                    items = body.get("pools") or body.get("data") or []
+                else:
+                    items = []
+                if items:
+                    pool = items[0]
+                    addr = pool.get("id") or pool.get("address")
+                    if addr:
+                        _pool_cache[mint] = addr
+                        return addr, False
+                return None, False
+            if r.status_code == 429:
+                dexpaprika_mark_limited()
+                logging.warning(f"⚠️ [DEXPAPRIKA] Rate limited on {mint[:8]}…")
+            elif r.status_code == 404:
+                return None, False
+        except Exception as e:
+            logging.warning(f"⚠️ [DEXPAPRIKA] Pool error {mint[:8]}…: {e}")
+
+    # ── Fallback: GeckoTerminal ──────────────────────────────────────
     if not gecko_available():
         return None, True
     url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}/pools"
@@ -590,11 +650,6 @@ def compute_momentum_signal(token):
 # SECURITY CHECKS
 # =====================================================================
 def check_gmgn_batch(mints):
-    """
-    DexScreener batch liquidity/safety check.
-    Uses shared 60s backoff: a 429 on any chunk skips all remaining
-    chunks that cycle and backs off before trying again.
-    """
     if not mints:
         return {}
     if not dex_available():
@@ -613,8 +668,7 @@ def check_gmgn_batch(mints):
             if res.status_code == 429:
                 dex_mark_limited()
                 logging.warning(
-                    f"⚠️ [SECURITY] DexScreener rate limited — "
-                    f"backing off {DEX_BACKOFF_SECONDS}s"
+                    f"⚠️ [SECURITY] DexScreener rate limited — backing off {DEX_BACKOFF_SECONDS}s"
                 )
                 break
             if res.status_code != 200:
@@ -752,12 +806,23 @@ def run_monitor():
                     entry = info.get("entry_price", 0)
                     if not price or entry == 0:
                         continue
+                    if price < MIN_VALID_PRICE:
+                        continue
 
                     symbol = info.get("symbol", "UNKNOWN")
                     gross  = (price - entry) / entry
-                    net    = gross - 2 * FEE_SLIPPAGE_PCT
-                    size   = info.get("trade_size", SOL_TRADE_SIZE)
-                    now    = time.time()
+
+                    if abs(gross) > MAX_GROSS_REALISTIC:
+                        logging.warning(
+                            f"⚠️ [MONITOR] ${symbol} suspicious gross "
+                            f"{gross*100:.0f}% — likely price feed error "
+                            f"(entry=${entry:.10f} price=${price:.10f}) — skipping tick"
+                        )
+                        continue
+
+                    net  = gross - 2 * FEE_SLIPPAGE_PCT
+                    size = info.get("trade_size", SOL_TRADE_SIZE)
+                    now  = time.time()
 
                     # ── Trailing stop bookkeeping ─────────────────────
                     peak_gross = info.get("peak_gross", gross)
@@ -791,7 +856,7 @@ def run_monitor():
                         )
                         risk_on_win()
                         log_trade(symbol, mint, "TP", entry, price,
-                                  info.get("signal_src", "?"), info.get("signal", 0))
+                                  info.get("signal_src", "?"), info.get("signal", 0), size)
                         try:
                             familiars_post(
                                 "trade",
@@ -817,7 +882,7 @@ def run_monitor():
                         )
                         risk_on_loss(abs(net_sol))
                         log_trade(symbol, mint, "SL", entry, price,
-                                  info.get("signal_src", "?"), info.get("signal", 0))
+                                  info.get("signal_src", "?"), info.get("signal", 0), size)
                         try:
                             familiars_post(
                                 "trade",
@@ -847,7 +912,7 @@ def run_monitor():
                         )
                         risk_on_win()
                         log_trade(symbol, mint, "TRAIL", entry, price,
-                                  info.get("signal_src", "?"), info.get("signal", 0))
+                                  info.get("signal_src", "?"), info.get("signal", 0), size)
                         try:
                             familiars_post(
                                 "trade",
@@ -880,11 +945,11 @@ def run_monitor():
                             f"WR={wr:.1f}% | Net={trade_stats['net_sol_pnl']:+.4f} SOL"
                         )
                         log_trade(symbol, mint, "STAGNANT", entry, price,
-                                  info.get("signal_src", "?"), info.get("signal", 0))
+                                  info.get("signal_src", "?"), info.get("signal", 0), size)
                         try:
                             familiars_post(
                                 "trade",
-                                f"Stagnant exit ({stagnant_mins:.0f}m no movement) "
+                                f"Stagnant exit ({stagnant_mins:.0f}m) "
                                 f"on ${symbol}. Net={trade_stats['net_sol_pnl']:+.4f} SOL",
                                 mint=mint
                             )
@@ -948,7 +1013,6 @@ def run_bot():
             token_map = fetch_jupiter_candidates()
             mints     = list(token_map.keys())
 
-            # Pass 1: pre-filter without API calls
             pre_filtered = []
             tally = {
                 "total":                    len(mints),
@@ -982,7 +1046,6 @@ def run_bot():
 
             security_results = check_gmgn_batch(pre_filtered) if pre_filtered else {}
 
-            # Pass 2: security + signal evaluation
             candidates = []
             for mint in pre_filtered:
                 token               = token_map[mint]
@@ -1068,8 +1131,7 @@ def run_bot():
             if candidates:
                 candidates.sort(key=lambda c: (c["ready"], c["signal"]), reverse=True)
                 top = " | ".join(
-                    f"${c['symbol']} {c['signal']:+.3f}"
-                    f"{'[M]' if c['ready'] else '[mom]'}"
+                    f"${c['symbol']} {c['signal']:+.3f}{'[M]' if c['ready'] else '[mom]'}"
                     for c in candidates[:5]
                 )
                 logging.info(f"🏆 [RANKING] {len(candidates)} qualified | Top: {top}")
@@ -1103,8 +1165,8 @@ def run_bot():
                         continue
 
                 live_price = get_price(mint)
-                if not live_price or live_price == 0:
-                    logging.info(f"⚠️ [ENTRY] ${cand['symbol']} — no live price, skipping")
+                if not live_price or live_price < MIN_VALID_PRICE:
+                    logging.info(f"⚠️ [ENTRY] ${cand['symbol']} — invalid live price, skipping")
                     continue
                 snapshot_price = cand["price"]
                 if snapshot_price and snapshot_price > 0:
@@ -1145,6 +1207,7 @@ def run_bot():
                         "peak_gross":     0.0,
                         "last_gross":     0.0,
                         "last_move_time": time.time(),
+                        "entry_time":     time.time(),
                     }
                     logging.info(
                         f"💰 [PAPER] BUY {size:.3f} SOL → "
@@ -1163,19 +1226,139 @@ def run_bot():
         time.sleep(sleep_time)
 
 # =====================================================================
-# FLASK HEALTH CHECK
+# FLASK — HTML TRADE DASHBOARD
 # =====================================================================
 app = Flask(__name__)
 
 @app.route("/")
 @app.route("/health")
 def health():
-    return (
-        f"Markov 2.0 Active | "
-        f"Positions={len(active_positions)} | "
-        f"Stats={trade_stats}",
-        200
-    )
+    total = trade_stats["total_closed"]
+    wins  = trade_stats["wins"]
+    losses = trade_stats["losses"]
+    wr    = wins / total * 100 if total > 0 else 0.0
+    net   = trade_stats["net_sol_pnl"]
+    pnl_color  = "#3fb950" if net >= 0 else "#f85149"
+    mode_badge = "🟡 PAPER" if PAPER_TRADING else "🟢 LIVE"
+
+    # ── Open positions ────────────────────────────────────────────────
+    now = time.time()
+    pos_rows = ""
+    for mint, info in list(active_positions.items()):
+        price = get_price(mint)
+        entry = info.get("entry_price", 0)
+        if price and entry and price >= MIN_VALID_PRICE:
+            g = (price - entry) / entry
+            if abs(g) <= MAX_GROSS_REALISTIC:
+                n     = g - 2 * FEE_SLIPPAGE_PCT
+                gc    = "#3fb950" if g >= 0 else "#f85149"
+                held  = int(now - info.get("entry_time", now))
+                h, m  = divmod(held // 60, 60)
+                dur   = f"{h}h {m}m" if h else f"{m}m"
+                peak  = info.get("peak_gross", 0) * 100
+                pos_rows += (
+                    f"<tr>"
+                    f"<td><b>${info['symbol']}</b></td>"
+                    f"<td style='color:{gc}'>{g*100:+.1f}%</td>"
+                    f"<td style='color:{gc}'>{n*100:+.1f}%</td>"
+                    f"<td style='color:#58a6ff'>{peak:+.1f}%</td>"
+                    f"<td style='color:#8b949e'>{dur}</td>"
+                    f"</tr>"
+                )
+    if not pos_rows:
+        pos_rows = "<tr><td colspan='5' style='color:#8b949e;padding:8px 4px'>No open positions</td></tr>"
+
+    # ── Recent trades from CSV ────────────────────────────────────────
+    trade_rows = ""
+    try:
+        if os.path.exists(TRADE_LOG_PATH):
+            with open(TRADE_LOG_PATH, newline="") as f:
+                rows = list(csv.DictReader(f))
+            outcome_colors = {
+                "TP": "#3fb950", "TRAIL": "#58a6ff",
+                "SL": "#f85149", "STAGNANT": "#d29922"
+            }
+            for row in reversed(rows[-30:]):
+                outcome = row.get("outcome", "?")
+                g_pct   = float(row.get("gross_pnl_pct", 0))
+                n_pct   = float(row.get("net_pnl_pct",   0))
+                n_sol   = float(row.get("net_pnl_sol",   0))
+                oc = outcome_colors.get(outcome, "#8b949e")
+                nc = "#3fb950" if n_sol >= 0 else "#f85149"
+                utc = row.get("utc", "")[:16].replace("T", " ")
+                trade_rows += (
+                    f"<tr>"
+                    f"<td style='color:#8b949e;font-size:0.7rem'>{utc}</td>"
+                    f"<td><b>${row.get('symbol','?')}</b></td>"
+                    f"<td style='color:{oc};font-weight:bold'>{outcome}</td>"
+                    f"<td style='color:{nc}'>{g_pct:+.1f}%</td>"
+                    f"<td style='color:{nc}'>{n_pct:+.1f}%</td>"
+                    f"<td style='color:{nc}'>{n_sol:+.4f}</td>"
+                    f"</tr>"
+                )
+    except Exception as e:
+        trade_rows = f"<tr><td colspan='6' style='color:#f85149'>CSV error: {e}</td></tr>"
+
+    if not trade_rows:
+        trade_rows = "<tr><td colspan='6' style='color:#8b949e;padding:8px 4px'>No trades yet</td></tr>"
+
+    html = f"""<!DOCTYPE html>
+<html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="30">
+<title>Markov 2.0</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',monospace;
+        background:#0d1117;color:#e6edf3;padding:16px;font-size:14px}}
+  h2{{color:#58a6ff;font-size:1rem;margin-bottom:14px}}
+  h3{{color:#8b949e;font-size:0.72rem;text-transform:uppercase;
+      letter-spacing:.06em;margin:18px 0 8px}}
+  .cards{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:4px}}
+  .card{{background:#161b22;border:1px solid #30363d;border-radius:8px;
+         padding:10px 14px;flex:1;min-width:70px}}
+  .cl{{color:#8b949e;font-size:0.68rem;margin-bottom:3px}}
+  .cv{{font-size:1.05rem;font-weight:700}}
+  table{{width:100%;border-collapse:collapse;font-size:0.75rem}}
+  th{{color:#8b949e;text-align:left;padding:5px 4px;
+      border-bottom:1px solid #21262d;font-weight:normal;font-size:0.68rem}}
+  td{{padding:5px 4px;border-bottom:1px solid #161b22;vertical-align:middle}}
+  .badge{{display:inline-block;padding:2px 8px;border-radius:4px;
+          font-size:0.7rem;font-weight:bold;background:#1f2937;margin-left:6px}}
+</style>
+</head><body>
+<h2>⚡ Markov 2.0
+  <span class="badge">{mode_badge}</span>
+  <span class="badge" style="color:#8b949e">auto-refresh 30s</span>
+</h2>
+
+<div class="cards">
+  <div class="card"><div class="cl">Closed</div><div class="cv">{total}</div></div>
+  <div class="card"><div class="cl">Win Rate</div><div class="cv">{wr:.1f}%</div></div>
+  <div class="card"><div class="cl">Net PnL</div>
+    <div class="cv" style="color:{pnl_color}">{net:+.4f} SOL</div></div>
+  <div class="card"><div class="cl">W / L</div>
+    <div class="cv">
+      <span style="color:#3fb950">{wins}</span> /
+      <span style="color:#f85149">{losses}</span>
+    </div></div>
+  <div class="card"><div class="cl">Open</div><div class="cv">{len(active_positions)}</div></div>
+</div>
+
+<h3>📈 Open Positions</h3>
+<table>
+  <tr><th>Symbol</th><th>Gross</th><th>Net</th><th>Peak</th><th>Held</th></tr>
+  {pos_rows}
+</table>
+
+<h3>📋 Recent Trades (last 30)</h3>
+<table>
+  <tr><th>UTC</th><th>Symbol</th><th>Exit</th><th>Gross</th><th>Net%</th><th>SOL</th></tr>
+  {trade_rows}
+</table>
+</body></html>"""
+    return html, 200
+
 
 def run_flask():
     import logging as _log
@@ -1183,8 +1366,9 @@ def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
+
 # =====================================================================
-# ENTRY POINT — threads start at module level so gunicorn picks them up
+# ENTRY POINT — threads at module level so gunicorn picks them up
 # =====================================================================
 threading.Thread(target=run_monitor, daemon=True).start()
 threading.Thread(target=run_bot,     daemon=True).start()
