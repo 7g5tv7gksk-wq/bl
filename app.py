@@ -46,7 +46,7 @@ STOP_LOSS_PCT            = 0.12
 BLACKLIST_COOLDOWN       = 7200
 SECURITY_REJECT_COOLDOWN = 14400
 MAX_POSITIONS            = 5
-LOOP_INTERVAL            = 30
+LOOP_INTERVAL            = 60
 OHLCV_TTL                = 300
 OHLCV_RETRY_COOLDOWN     = 45
 TRACKER_STALE_SECONDS    = 3600
@@ -565,7 +565,7 @@ def fetch_jupiter_candidates():
                     items = data.get("data") or data.get("tokens") or []
                 else:
                     items = []
-                for item in items[:20]:
+                for item in items[:10]:
                     addr = item.get("address") or item.get("mint") or item.get("id")
                     if addr and addr not in token_map:
                         token_map[addr] = item
