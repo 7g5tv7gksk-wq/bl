@@ -47,6 +47,7 @@ BLACKLIST_COOLDOWN       = 7200
 SECURITY_REJECT_COOLDOWN = 14400
 MAX_POSITIONS            = 5
 LOOP_INTERVAL            = 60
+ITEMS_PER_SOURCE         = 15
 OHLCV_TTL                = 300
 OHLCV_RETRY_COOLDOWN     = 45
 TRACKER_STALE_SECONDS    = 3600
@@ -138,10 +139,6 @@ risk_state = {
 BULL, BEAR, SIDEWAYS = 0, 1, 2
 STATE_NAME = {BULL: "BULL", BEAR: "BEAR", SIDEWAYS: "SIDEWAYS"}
 
-# Price cache — last known good price per mint.
-# Prevents SL from being skipped during API rate-limit windows.
-# The monitor uses stale cache (up to 45s old) rather than returning
-# None and silently skipping the position check entirely.
 _price_cache        = {}
 PRICE_CACHE_MAX_AGE = 45
 
@@ -342,7 +339,6 @@ def resolve_pool_address(mint, graduated_pool_hint=None):
     if mint in _pool_cache:
         return _pool_cache[mint], False
 
-    # Primary: DexPaprika (free, no key, generous limits)
     if dexpaprika_available():
         url = (f"{DEXPAPRIKA_BASE}/networks/solana/tokens/{mint}/pools"
                f"?order_by=volume_usd&sort=desc&limit=1")
@@ -371,7 +367,6 @@ def resolve_pool_address(mint, graduated_pool_hint=None):
         except Exception as e:
             logging.warning(f"⚠️ [DEXPAPRIKA] Pool error {mint[:8]}…: {e}")
 
-    # Fallback: GeckoTerminal
     if not gecko_available():
         return None, True
     url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}/pools"
@@ -449,9 +444,7 @@ def _verify_labels(states, candles, stride):
         if ret >  5 and states[idx] == BEAR: errors += 1
         if ret < -5 and states[idx] == BULL: errors += 1
     if errors:
-        logging.warning(
-            f"⚠️ [MARKOV FIX2] {errors} label anomaly(s) — confidence lower"
-        )
+        logging.warning(f"⚠️ [MARKOV] {errors} label anomaly(s) — confidence lower")
     return errors == 0
 
 def _markov_signal(matrix, current_state):
@@ -508,8 +501,8 @@ class CoinMarkovTracker:
                     if self.pool_resolve_attempts >= POOL_RESOLVE_MAX_ATTEMPTS:
                         self.pool_abandoned = True
                         logging.info(
-                            f"📉 [POOL] Giving up on ${self.symbol} — "
-                            f"no pool after {self.pool_resolve_attempts} checks"
+                            f"📉 [POOL] Giving up on ${self.symbol} after "
+                            f"{self.pool_resolve_attempts} checks"
                         )
                 return
         ttl = OHLCV_TTL if self.candles else OHLCV_RETRY_COOLDOWN
@@ -544,13 +537,20 @@ class CoinMarkovTracker:
 # CANDIDATE DISCOVERY
 # =====================================================================
 def fetch_jupiter_candidates():
+    """
+    Returns {mint: token_object} for up to ITEMS_PER_SOURCE*2 candidates.
+    Staggered 2s between sources so both requests don't hit Jupiter's
+    shared-IP rate limiter in the same instant.
+    """
     token_map     = {}
     source_report = []
     sources = [
         ("recent",     "https://api.jup.ag/tokens/v2/recent"),
         ("trending5m", "https://api.jup.ag/tokens/v2/toptrending/5m"),
     ]
-    for label, url in sources:
+    for idx, (label, url) in enumerate(sources):
+        if idx > 0:
+            time.sleep(2)
         if not jup_available():
             source_report.append((label, 0, "skipped(backoff)"))
             continue
@@ -565,7 +565,7 @@ def fetch_jupiter_candidates():
                     items = data.get("data") or data.get("tokens") or []
                 else:
                     items = []
-                for item in items[:10]:
+                for item in items[:ITEMS_PER_SOURCE]:
                     addr = item.get("address") or item.get("mint") or item.get("id")
                     if addr and addr not in token_map:
                         token_map[addr] = item
@@ -581,10 +581,8 @@ def fetch_jupiter_candidates():
                 source_report.append((label, 0, f"HTTP {r.status_code}"))
         except Exception as e:
             source_report.append((label, 0, f"exc: {e}"))
-    breakdown = " | ".join(
-        f"{label}:{count}({note})" for label, count, note in source_report
-    )
-    logging.info(f"📡 [SCRAPER] {len(token_map)} candidate tokens | {breakdown}")
+    breakdown = " | ".join(f"{label}:{count}({note})" for label, count, note in source_report)
+    logging.info(f"📡 [SCRAPER] {len(token_map)} candidates | {breakdown}")
     return token_map
 
 # =====================================================================
@@ -654,6 +652,8 @@ def check_gmgn_batch(mints):
     for i in range(0, len(mints), 10):
         if not dex_available():
             break
+        if i > 0:
+            time.sleep(1.5)
         chunk = mints[i:i + 10]
         url   = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(chunk)}"
         try:
@@ -678,7 +678,7 @@ def check_gmgn_batch(mints):
                 token_pairs = pairs_by_mint.get(mint, [])
                 if not token_pairs:
                     results[mint] = False
-                    logging.info(f"🛡️ [SECURITY] {mint[:8]}… — no active pair on DexScreener")
+                    logging.info(f"🛡️ [SECURITY] {mint[:8]}… — no pair on DexScreener")
                     continue
                 main_pair = token_pairs[0]
                 liquidity = float(main_pair.get("liquidity", {}).get("usd", 0) or 0)
@@ -690,11 +690,11 @@ def check_gmgn_batch(mints):
                 if fdv > 0 and (liquidity / fdv) < 0.01:
                     results[mint] = False
                     logging.info(
-                        f"🛡️ [SECURITY] {mint[:8]}… — thin liquidity ratio {liquidity/fdv:.2%}"
+                        f"🛡️ [SECURITY] {mint[:8]}… — thin ratio {liquidity/fdv:.2%}"
                     )
                     continue
         except Exception as e:
-            logging.warning(f"⚠️ [SECURITY] DexScreener batch error: {e}")
+            logging.warning(f"⚠️ [SECURITY] DexScreener error: {e}")
     return results
 
 
@@ -730,7 +730,6 @@ def _cache_price(mint, price):
 
 
 def get_price(mint):
-    """Fetch live price, updating _price_cache on every success."""
     # 1. Jupiter Price API v2
     if jup_available():
         try:
@@ -748,7 +747,7 @@ def get_price(mint):
         except Exception:
             pass
 
-    # 2. Jupiter Token Search API
+    # 2. Jupiter Token Search
     if jup_available():
         try:
             r = requests.get(
@@ -773,7 +772,7 @@ def get_price(mint):
         except Exception:
             pass
 
-    # 3. DexPaprika pool price (free, no rate-limit issues)
+    # 3. DexPaprika (free, no rate-limit issues)
     if dexpaprika_available() and mint in _pool_cache:
         try:
             pool = _pool_cache[mint]
@@ -794,7 +793,7 @@ def get_price(mint):
         except Exception:
             pass
 
-    # 4. DexScreener last resort (rate-limited on shared IP — use sparingly)
+    # 4. DexScreener last resort
     if dex_available():
         try:
             r = requests.get(
@@ -817,25 +816,17 @@ def get_price(mint):
 
 
 def get_price_for_monitor(mint):
-    """
-    Used only by the position monitor. Falls back to stale cached price
-    (up to PRICE_CACHE_MAX_AGE seconds old) rather than returning None
-    when all APIs are rate-limited — this is what was causing -70%/-98%
-    SL blow-throughs: the monitor skipped the entire position check.
-    Returns (price, is_stale).
-    """
+    """Falls back to cached price during rate-limit windows to prevent SL blow-through."""
     live = get_price(mint)
     if live:
         return live, False
     cached = _price_cache.get(mint)
-    if cached:
-        age = time.time() - cached["ts"]
-        if age <= PRICE_CACHE_MAX_AGE:
-            return cached["price"], True
+    if cached and (time.time() - cached["ts"]) <= PRICE_CACHE_MAX_AGE:
+        return cached["price"], True
     return None, False
 
 # =====================================================================
-# POSITION MONITOR — 1-second background thread
+# POSITION MONITOR
 # =====================================================================
 def run_monitor():
     logging.info("⚡ [MONITOR] Position monitor started (1s loop)")
@@ -854,9 +845,7 @@ def run_monitor():
 
                     price, is_stale = get_price_for_monitor(mint)
                     entry = info.get("entry_price", 0)
-                    if not price or entry == 0:
-                        continue
-                    if price < MIN_VALID_PRICE:
+                    if not price or entry == 0 or price < MIN_VALID_PRICE:
                         continue
 
                     symbol = info.get("symbol", "UNKNOWN")
@@ -865,8 +854,7 @@ def run_monitor():
                     if abs(gross) > MAX_GROSS_REALISTIC:
                         logging.warning(
                             f"⚠️ [MONITOR] ${symbol} suspicious gross "
-                            f"{gross*100:.0f}% (entry={entry:.10f} "
-                            f"price={price:.10f}) — skipping tick"
+                            f"{gross*100:.0f}% — skipping tick"
                         )
                         continue
 
@@ -877,17 +865,14 @@ def run_monitor():
                     if is_stale:
                         age = round(now - _price_cache.get(mint, {}).get("ts", now))
                         logging.warning(
-                            f"⚠️ [MONITOR] ${symbol} using cached price "
-                            f"({age}s old) — all APIs rate-limited"
+                            f"⚠️ [MONITOR] ${symbol} using cached price ({age}s old)"
                         )
 
-                    # ── Trailing stop bookkeeping ─────────────────────
                     peak_gross = info.get("peak_gross", gross)
                     if gross > peak_gross:
                         peak_gross = gross
                         active_positions[mint]["peak_gross"] = peak_gross
 
-                    # ── Stagnant exit bookkeeping ─────────────────────
                     last_gross     = info.get("last_gross", gross)
                     last_move_time = info.get("last_move_time", now)
                     if abs(gross - last_gross) > STAGNANT_THRESHOLD_PCT:
@@ -899,7 +884,6 @@ def run_monitor():
                         f"${symbol} {gross*100:+.1f}% / {net*100:+.1f}% net"
                     )
 
-                    # ── Take profit ───────────────────────────────────
                     if gross >= TAKE_PROFIT_PCT:
                         net_sol = size * net
                         trade_stats["total_closed"] += 1
@@ -907,14 +891,12 @@ def run_monitor():
                         trade_stats["net_sol_pnl"]  += net_sol
                         wr = trade_stats["wins"] / trade_stats["total_closed"] * 100
                         logging.info(
-                            f"🎯 [TP] ${symbol} +{gross*100:.1f}% gross | "
-                            f"net {net*100:.1f}% | +{net_sol:.4f} SOL | "
-                            f"WR={wr:.1f}%"
+                            f"🎯 [TP] ${symbol} +{gross*100:.1f}% | "
+                            f"net {net*100:.1f}% | +{net_sol:.4f} SOL | WR={wr:.1f}%"
                         )
                         risk_on_win()
                         log_trade(symbol, mint, "TP", entry, price,
-                                  info.get("signal_src", "?"),
-                                  info.get("signal", 0), size)
+                                  info.get("signal_src", "?"), info.get("signal", 0), size)
                         try:
                             familiars_post("trade",
                                 f"TP +{gross*100:.1f}% on ${symbol}", mint=mint)
@@ -922,7 +904,6 @@ def run_monitor():
                             pass
                         to_close.append(mint)
 
-                    # ── Stop loss ─────────────────────────────────────
                     elif gross <= -STOP_LOSS_PCT:
                         net_sol = size * net
                         trade_stats["total_closed"] += 1
@@ -930,14 +911,12 @@ def run_monitor():
                         trade_stats["net_sol_pnl"]   += net_sol
                         wr = trade_stats["wins"] / trade_stats["total_closed"] * 100
                         logging.info(
-                            f"🛑 [SL] ${symbol} {gross*100:.1f}% gross | "
-                            f"net {net*100:.1f}% | {net_sol:.4f} SOL | "
-                            f"WR={wr:.1f}%"
+                            f"🛑 [SL] ${symbol} {gross*100:.1f}% | "
+                            f"net {net*100:.1f}% | {net_sol:.4f} SOL | WR={wr:.1f}%"
                         )
                         risk_on_loss(abs(net_sol))
                         log_trade(symbol, mint, "SL", entry, price,
-                                  info.get("signal_src", "?"),
-                                  info.get("signal", 0), size)
+                                  info.get("signal_src", "?"), info.get("signal", 0), size)
                         try:
                             familiars_post("trade",
                                 f"SL {gross*100:.1f}% on ${symbol}. Blacklisting 2h.",
@@ -947,7 +926,6 @@ def run_monitor():
                         stopped_out_tokens[mint] = time.time()
                         to_close.append(mint)
 
-                    # ── Trailing stop ─────────────────────────────────
                     elif (peak_gross >= TRAIL_ACTIVATE_PCT
                           and gross <= peak_gross - TRAIL_DISTANCE_PCT
                           and mint not in to_close):
@@ -959,13 +937,11 @@ def run_monitor():
                         logging.info(
                             f"📍 [TRAIL] ${symbol} {gross*100:+.1f}% | "
                             f"peak {peak_gross*100:+.1f}% | "
-                            f"net {net*100:.1f}% | +{net_sol:.4f} SOL | "
-                            f"WR={wr:.1f}%"
+                            f"net {net*100:.1f}% | +{net_sol:.4f} SOL | WR={wr:.1f}%"
                         )
                         risk_on_win()
                         log_trade(symbol, mint, "TRAIL", entry, price,
-                                  info.get("signal_src", "?"),
-                                  info.get("signal", 0), size)
+                                  info.get("signal_src", "?"), info.get("signal", 0), size)
                         try:
                             familiars_post("trade",
                                 f"Trail {gross*100:+.1f}% (peak {peak_gross*100:+.1f}%) "
@@ -974,7 +950,6 @@ def run_monitor():
                             pass
                         to_close.append(mint)
 
-                    # ── Stagnant exit ─────────────────────────────────
                     elif (now - last_move_time > STAGNANT_EXIT_SECONDS
                           and mint not in to_close):
                         net_sol = size * net
@@ -989,16 +964,14 @@ def run_monitor():
                         wr = trade_stats["wins"] / trade_stats["total_closed"] * 100
                         mins = (now - last_move_time) / 60
                         logging.info(
-                            f"⏸️ [STAGNANT] ${symbol} no movement {mins:.0f}m | "
-                            f"gross {gross*100:+.1f}% | net {net*100:.1f}% | "
-                            f"{net_sol:+.4f} SOL | WR={wr:.1f}%"
+                            f"⏸️ [STAGNANT] ${symbol} {mins:.0f}m | "
+                            f"gross {gross*100:+.1f}% | {net_sol:+.4f} SOL | WR={wr:.1f}%"
                         )
                         log_trade(symbol, mint, "STAGNANT", entry, price,
-                                  info.get("signal_src", "?"),
-                                  info.get("signal", 0), size)
+                                  info.get("signal_src", "?"), info.get("signal", 0), size)
                         try:
                             familiars_post("trade",
-                                f"Stagnant exit {mins:.0f}m on ${symbol}", mint=mint)
+                                f"Stagnant {mins:.0f}m on ${symbol}", mint=mint)
                         except Exception:
                             pass
                         to_close.append(mint)
@@ -1020,7 +993,8 @@ def run_monitor():
 def run_bot():
     logging.info(
         f"🚀 [BOT] Markov 2.0 | Paper={PAPER_TRADING} | "
-        f"Stride={STRIDE_BARS}×5m | MinWindows={MIN_WINDOWS}"
+        f"Stride={STRIDE_BARS}×5m | MinWindows={MIN_WINDOWS} | "
+        f"Loop={LOOP_INTERVAL}s | ItemsPerSource={ITEMS_PER_SOURCE}"
     )
     while True:
         cycle_start = time.time()
@@ -1046,8 +1020,14 @@ def run_bot():
             if stale:
                 logging.info(f"🧹 [PRUNE] Dropped {len(stale)} stale tracker(s)")
 
-            for tracker in list(coin_trackers.values()):
+            # Stagger tracker refreshes — spread 30+ coins across 20s
+            # so GeckoTerminal/DexPaprika calls don't all fire at once
+            trackers_list = list(coin_trackers.values())
+            stagger_gap   = min(0.7, 20.0 / max(len(trackers_list), 1))
+            for tracker in trackers_list:
                 tracker.refresh()
+                if stagger_gap > 0.05:
+                    time.sleep(stagger_gap)
 
             logging.info(
                 f"🔎 [SCAN] SOL={sol_regime} | "
@@ -1059,7 +1039,7 @@ def run_bot():
 
             pre_filtered = []
             tally = {
-                "total": len(mints),
+                "total":                    len(mints),
                 "in_position_or_blacklist": 0,
                 "no_token_data":            0,
                 "failed_filters":           0,
@@ -1283,7 +1263,6 @@ def health():
     net    = trade_stats["net_sol_pnl"]
     mode_badge = "🟡 PAPER" if PAPER_TRADING else "🟢 LIVE"
 
-    # ── Open positions ────────────────────────────────────────────────
     now = time.time()
     pos_rows = ""
     for mint, info in list(active_positions.items()):
@@ -1310,17 +1289,14 @@ def health():
     if not pos_rows:
         pos_rows = "<tr><td colspan='5' style='color:#8b949e;padding:8px 4px'>No open positions</td></tr>"
 
-    # ── Recent trades from CSV ────────────────────────────────────────
-    trade_rows   = ""
+    trade_rows    = ""
     csv_total_sol = 0.0
-    rows = []
+    rows          = []
     try:
         if os.path.exists(TRADE_LOG_PATH):
             with open(TRADE_LOG_PATH, newline="") as f:
                 rows = list(csv.DictReader(f))
-
             csv_total_sol = sum(float(r.get("net_pnl_sol", 0)) for r in rows)
-
             outcome_colors = {
                 "TP": "#3fb950", "TRAIL": "#58a6ff",
                 "SL": "#f85149", "STAGNANT": "#d29922"
@@ -1389,7 +1365,6 @@ def health():
   <span class="badge">{mode_badge}</span>
   <span class="badge" style="color:#8b949e">auto-refresh 30s</span>
 </h2>
-
 <div class="cards">
   <div class="card"><div class="cl">Closed</div><div class="cv">{total}</div></div>
   <div class="card"><div class="cl">Win Rate</div><div class="cv">{wr:.1f}%</div></div>
@@ -1402,13 +1377,11 @@ def health():
     </div></div>
   <div class="card"><div class="cl">Open</div><div class="cv">{len(active_positions)}</div></div>
 </div>
-
 <h3>📈 Open Positions</h3>
 <table>
   <tr><th>Symbol</th><th>Gross</th><th>Net</th><th>Peak</th><th>Held</th></tr>
   {pos_rows}
 </table>
-
 <h3>📋 Recent Trades — CSV Total: <span style="color:{display_color}">{display_net:+.4f} SOL</span></h3>
 <table>
   <tr><th>UTC</th><th>Symbol</th><th>Exit</th>
